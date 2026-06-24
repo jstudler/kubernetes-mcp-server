@@ -161,6 +161,15 @@ type StaticConfig struct {
 	// ConfirmationRules define rules for prompting the user before dangerous actions.
 	ConfirmationRules []api.ConfirmationRule `toml:"confirmation_rules,omitempty"`
 
+	// MaskRules define data masking rules for Kubernetes API responses.
+	// Each rule can mask specific fields in specific resource kinds (field rules)
+	// or apply regex-based replacement across the serialized response (regex rules).
+	MaskRules []api.MaskRule `toml:"mask_rules,omitempty"`
+
+	// MaskValue is the replacement string used when masking sensitive data.
+	// Defaults to "[MASK]" if not set.
+	MaskValue string `toml:"mask_value,omitempty"`
+
 	// Internal: parsed provider configs (not exposed to TOML package)
 	parsedClusterProviderConfigs map[string]api.ExtendedConfig
 	// Internal: parsed toolset configs (not exposed to TOML package)
@@ -461,6 +470,17 @@ func (c *StaticConfig) IsRequireTLS() bool {
 
 func (c *StaticConfig) IsRequireOAuth() bool {
 	return c.RequireOAuth
+}
+
+func (c *StaticConfig) GetMaskRules() []api.MaskRule {
+	return c.MaskRules
+}
+
+func (c *StaticConfig) GetMaskValue() string {
+	if c.MaskValue == "" {
+		return "[MASK]"
+	}
+	return c.MaskValue
 }
 
 // WithProviderStrategies sets the known cluster-provider strategies for

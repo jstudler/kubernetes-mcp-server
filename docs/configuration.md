@@ -29,6 +29,7 @@ This reference focuses on TOML file configuration. For CLI arguments, see the [C
   - [Telemetry](#telemetry)
   - [Validation](#validation)
   - [Confirmation Rules](#confirmation-rules)
+  - [Response Mask Rules](#response-mask-rules)
   - [Toolset-Specific Configuration](#toolset-specific-configuration)
   - [Cluster Provider Configuration](#cluster-provider-configuration)
 - [CLI Configuration Options](#cli-configuration-options)
@@ -640,6 +641,59 @@ message = "Deleting in kube-system."
 verb = "get"
 kind = "Secret"
 message = "Accessing a Secret."
+```
+
+### Response Mask Rules
+
+Mask or redact sensitive data in Kubernetes API responses before they reach the AI model. This is useful for two main scenarios:
+
+- **Data leakage / loss prevention** — Prevent secrets, tokens, IP addresses, and other sensitive values from being sent to the model.
+- **Token reduction** — Strip large, low-value fields (e.g. `last-applied-configuration` annotations) to reduce context size and cost.
+
+Masked values are replaced with `[MASK]`. Rules are evaluated at the HTTP transport level, so masking applies to all tool responses.
+
+Each rule is defined as a `[[mask_rules]]` entry with three optional fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kinds` | string array | Kubernetes resource kinds to scope the rule to (e.g. `["Secret"]`). If empty, the rule applies to all kinds. |
+| `paths` | string array | Dot-separated field paths whose values are replaced with `[MASK]`. Supports map wildcards (`data.*` masks all values under `data`). |
+| `regex` | string | Regular expression pattern. All matches in the serialized JSON response are replaced with `[MASK]`. Applied after field-based masking. |
+
+At least one of `kinds`, `paths`, or `regex` must be set. The fields combine as follows:
+
+- **Kinds only** — The entire resource is masked (all non-identity fields replaced) for matching kinds.
+- **Kinds + Paths** — Only the specified field paths are masked within matching kinds.
+- **Kinds + Regex** — The regex is applied only to responses for matching kinds.
+- **Paths only** — The specified field paths are masked in all resource kinds.
+- **Regex only** — The regex is applied to all responses regardless of kind.
+
+**Examples:**
+
+```toml
+# Mask Kubernetes Secret data and stringData values (keys preserved)
+[[mask_rules]]
+kinds = ["Secret"]
+paths = ["data.*", "stringData.*"]
+
+# Mask sensitive env var values in Pod specs
+[[mask_rules]]
+kinds = ["Pod"]
+paths = ["spec.containers.env.value", "spec.initContainers.env.value"]
+
+# Mask IPv4 addresses (host and CIDR notation) in Services
+[[mask_rules]]
+kinds = ["Service"]
+regex = '(?:\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))(?:/[0-9]{1,2})?\b'
+
+# Mask IPv6 addresses (host and CIDR notation) in Services
+[[mask_rules]]
+kinds = ["Service"]
+regex = '(?i)(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}|::(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}|::)(?:/[0-9]{1,3})?'
+
+# Reduce token usage: mask last-applied-configuration in all resource kinds
+[[mask_rules]]
+paths = ["metadata.annotations.kubectl.kubernetes.io/last-applied-configuration"]
 ```
 
 ### Toolset-Specific Configuration

@@ -81,6 +81,25 @@ func NewKubernetes(
 			ConfirmationRulesProvider: baseConfig,
 		})
 	})
+	// Response filter wraps the outermost layer so it can mask sensitive data
+	// in Kubernetes API responses before they reach the MCP output pipeline.
+	if rules := baseConfig.GetMaskRules(); len(rules) > 0 {
+		k.restConfig.Wrap(func(original http.RoundTripper) http.RoundTripper {
+			rt, err := NewResponseFilterRoundTripper(ResponseFilterConfig{
+				Delegate:  original,
+				MaskRules: rules,
+				MaskValue: baseConfig.GetMaskValue(),
+			})
+			if err != nil {
+				// Programming error: config validation should catch invalid regexes.
+				panic(fmt.Sprintf("invalid mask_rules configuration: %v", err))
+			}
+			if rt == nil {
+				return original
+			}
+			return rt
+		})
+	}
 	k.restConfig.Wrap(func(original http.RoundTripper) http.RoundTripper {
 		return &UserAgentRoundTripper{delegate: original}
 	})
