@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -29,7 +30,8 @@ const (
 	OAuthAuthorizationHeader  = HeaderKey("Authorization")
 	UserAgentHeader           = HeaderKey("User-Agent")
 
-	CustomUserAgent = "kubernetes-mcp-server/bearer-token-auth"
+	CustomUserAgent         = "kubernetes-mcp-server/bearer-token-auth"
+	defaultDiscoveryTimeout = 10 * time.Second
 )
 
 type CloseWatchKubeConfig func() error
@@ -42,14 +44,15 @@ var ParameterCodec = runtime.NewParameterCodec(Scheme)
 // apiVersion and kinds are checked for allowed access
 type Kubernetes struct {
 	kubernetes.Interface
-	config          api.BaseConfig
-	clientCmdConfig clientcmd.ClientConfig
-	restConfig      *rest.Config
-	httpClient      *http.Client
-	restMapper      meta.ResettableRESTMapper
-	discoveryClient discovery.CachedDiscoveryInterface
-	dynamicClient   dynamic.Interface
-	metricsV1beta1  *metricsv1beta1.MetricsV1beta1Client
+	config             api.BaseConfig
+	clientCmdConfig    clientcmd.ClientConfig
+	restConfig         *rest.Config
+	httpClient         *http.Client
+	restMapper         meta.ResettableRESTMapper
+	discoveryClient    discovery.CachedDiscoveryInterface
+	rawDiscoveryClient discovery.DiscoveryInterface
+	dynamicClient      dynamic.Interface
+	metricsV1beta1     *metricsv1beta1.MetricsV1beta1Client
 }
 
 var _ api.KubernetesClient = (*Kubernetes)(nil)
@@ -76,6 +79,7 @@ func NewKubernetes(
 			RestMapperProvider:        func() meta.RESTMapper { return k.restMapper },
 			HostURL:                   k.restConfig.Host,
 			DiscoveryProvider:         func() discovery.DiscoveryInterface { return k.discoveryClient },
+			RawDiscoveryProvider:      func() discovery.DiscoveryInterface { return k.rawDiscoveryClient },
 			AuthClientProvider:        func() authv1client.AuthorizationV1Interface { return k.AuthorizationV1() },
 			ValidationEnabled:         baseConfig.IsValidationEnabled(),
 			ConfirmationRulesProvider: baseConfig,
@@ -108,10 +112,17 @@ func NewKubernetes(
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
-	discoveryClient, err := discovery.NewDiscoveryClientForConfigAndClient(k.restConfig, k.httpClient)
+	// Discovery runs synchronously while tools are registered. Use a client copy
+	// so an unreachable cluster cannot block startup without timing out watches or execs.
+	discoveryHTTPClient := *k.httpClient
+	if discoveryHTTPClient.Timeout <= 0 {
+		discoveryHTTPClient.Timeout = defaultDiscoveryTimeout
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfigAndClient(k.restConfig, &discoveryHTTPClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create discovery client: %w", err)
 	}
+	k.rawDiscoveryClient = discoveryClient
 	k.discoveryClient = memory.NewMemCacheClient(discoveryClient)
 	k.restMapper = restmapper.NewDeferredDiscoveryRESTMapper(k.discoveryClient)
 	k.Interface, err = kubernetes.NewForConfigAndClient(k.restConfig, k.httpClient)

@@ -11,7 +11,6 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
-	"k8s.io/klog/v2"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
@@ -58,14 +57,9 @@ func AuthorizationMiddleware(cfgState *config.StaticConfigState, oauthState *oau
 	var skipJWTWarningOnce sync.Once
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			logger := klog.FromContext(r.Context())
+			logger := klogutil.FromContext(r.Context())
 			// Skip auth for infrastructure endpoints (health, metrics) and well-known endpoints
-			// Use prefix matching per endpoint to handle sub-paths like /.well-known/oauth-protected-resource/sse
-			requestPath := r.URL.EscapedPath()
-			isWellKnown := !strings.Contains(requestPath, "..") && slices.ContainsFunc(WellKnownEndpoints, func(ep string) bool {
-				return requestPath == ep || strings.HasPrefix(requestPath, ep+"/")
-			})
-			if slices.Contains(infraPaths, r.URL.Path) || isWellKnown {
+			if slices.Contains(infraPaths, r.URL.Path) || isWellKnownPath(r.URL.EscapedPath()) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -224,9 +218,11 @@ func (c *JWTClaims) ValidateOffline(audience string) error {
 // ValidateWithProvider validates the JWT claims against the OIDC provider.
 func (c *JWTClaims) ValidateWithProvider(ctx context.Context, audience string, provider *oidc.Provider) error {
 	if provider != nil {
-		verifier := provider.Verifier(&oidc.Config{
-			ClientID: audience,
-		})
+		cfg := &oidc.Config{ClientID: audience}
+		if audience == "" {
+			cfg.SkipClientIDCheck = true
+		}
+		verifier := provider.Verifier(cfg)
 		_, err := verifier.Verify(ctx, c.Token)
 		if err != nil {
 			return fmt.Errorf("OIDC token validation error: %w", err)

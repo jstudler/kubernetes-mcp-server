@@ -10,6 +10,7 @@ import (
 	vm_create "github.com/containers/kubernetes-mcp-server/pkg/toolsets/kubevirt/vm/create"
 	vm_guestagent "github.com/containers/kubernetes-mcp-server/pkg/toolsets/kubevirt/vm/guestagent"
 	vm_lifecycle "github.com/containers/kubernetes-mcp-server/pkg/toolsets/kubevirt/vm/lifecycle"
+	vm_troubleshoot "github.com/containers/kubernetes-mcp-server/pkg/toolsets/kubevirt/vm/troubleshoot"
 )
 
 type Toolset struct{}
@@ -24,12 +25,13 @@ func (t *Toolset) GetDescription() string {
 	return kubevirtdefaults.ToolsetDescription()
 }
 
-func (t *Toolset) GetTools(_ api.Openshift) []api.ServerTool {
+func (t *Toolset) GetTools(p api.FilteringProvider) []api.ServerTool {
 	return slices.Concat(
-		vm_clone.Tools(),
-		vm_create.Tools(),
-		vm_guestagent.Tools(),
-		vm_lifecycle.Tools(),
+		vm_clone.Tools(p),
+		vm_create.Tools(p),
+		vm_guestagent.Tools(p),
+		vm_lifecycle.Tools(p),
+		vm_troubleshoot.Tools(p),
 	)
 }
 

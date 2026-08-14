@@ -1,6 +1,9 @@
 package kubevirt
 
 import (
+	"context"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -100,6 +103,24 @@ var (
 	}
 )
 
+// Migration resources
+var (
+	// VirtualMachineInstanceMigrationGVR is the GroupVersionResource for VirtualMachineInstanceMigration resources
+	VirtualMachineInstanceMigrationGVR = schema.GroupVersionResource{
+		Group:    "kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachineinstancemigrations",
+	}
+)
+
+// HasVirtualMachine returns a TargetCompatibilityFilter that checks whether any
+// target cluster has the VirtualMachine GVK registered.
+func HasVirtualMachine(p api.FilteringProvider) func() bool {
+	return func() bool {
+		return p.AnyTargetHasGVKs(context.TODO(), []schema.GroupVersionKind{VirtualMachineGVK})
+	}
+}
+
 // Kubernetes core resources
 var (
 	// PersistentVolumeClaimGVR is the GroupVersionResource for PersistentVolumeClaim resources
@@ -114,5 +135,12 @@ var (
 		Group:    "",
 		Version:  "v1",
 		Resource: "pods",
+	}
+
+	// StorageClassGVR is the GroupVersionResource for StorageClass resources
+	StorageClassGVR = schema.GroupVersionResource{
+		Group:    "storage.k8s.io",
+		Version:  "v1",
+		Resource: "storageclasses",
 	}
 )

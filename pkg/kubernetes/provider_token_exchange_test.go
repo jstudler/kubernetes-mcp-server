@@ -27,10 +27,11 @@ type TokenExchangingProviderSuite struct {
 }
 
 type observedTokenRequest struct {
-	clientID     string
-	clientSecret string
-	audience     string
-	scope        string
+	clientID         string
+	clientSecret     string
+	audience         string
+	scope            string
+	subjectTokenType string
 }
 
 type exchangeTestOIDCServer struct {
@@ -53,7 +54,6 @@ func (a *exchangeTestOIDCServer) recordedRequests() []observedTokenRequest {
 
 type fakeDerivedProvider struct{}
 
-func (fakeDerivedProvider) IsOpenShift(context.Context) bool             { return false }
 func (fakeDerivedProvider) IsMultiTarget() bool                          { return false }
 func (fakeDerivedProvider) GetTargets(context.Context) ([]string, error) { return []string{""}, nil }
 func (fakeDerivedProvider) GetDefaultTarget() string                     { return "" }
@@ -63,8 +63,11 @@ func (fakeDerivedProvider) Close()                                       {}
 func (fakeDerivedProvider) GetDerivedKubernetes(context.Context, string) (*Kubernetes, error) {
 	return &Kubernetes{}, nil
 }
-func (fakeDerivedProvider) HasGVKs(context.Context, []schema.GroupVersionKind) bool {
+func (fakeDerivedProvider) AnyTargetHasGVKs(context.Context, []schema.GroupVersionKind) bool {
 	return true
+}
+func (fakeDerivedProvider) IsTargetCompatibilityToolFiltersEnabled() bool {
+	return false
 }
 
 func (s *TokenExchangingProviderSuite) TestGetDerivedKubernetes() {
@@ -102,16 +105,18 @@ func (s *TokenExchangingProviderSuite) TestGetDerivedKubernetes() {
 		requests := authServer.recordedRequests()
 		s.Require().Len(requests, 2)
 		s.Equal(observedTokenRequest{
-			clientID:     "old-client",
-			clientSecret: "old-secret",
-			audience:     "old-audience",
-			scope:        "old-scope",
+			clientID:         "old-client",
+			clientSecret:     "old-secret",
+			audience:         "old-audience",
+			scope:            "old-scope",
+			subjectTokenType: tokenexchange.TokenTypeAccessToken,
 		}, requests[0])
 		s.Equal(observedTokenRequest{
-			clientID:     "new-client",
-			clientSecret: "new-secret",
-			audience:     "new-audience",
-			scope:        "new-scope",
+			clientID:         "new-client",
+			clientSecret:     "new-secret",
+			audience:         "new-audience",
+			scope:            "new-scope",
+			subjectTokenType: tokenexchange.TokenTypeAccessToken,
 		}, requests[1])
 	})
 }
@@ -250,6 +255,45 @@ func (s *TokenExchangingProviderSuite) TestGetOrBuildStsConfig() {
 			s.Require().NotNil(second)
 			s.NotSame(first, second)
 		})
+
+		s.Run("tls_min_version", func() {
+			snap := s.newSnapshot()
+			cfg := config.Default()
+			cfg.TokenExchangeStrategy = tokenexchange.StrategyRFC8693
+			cfg.StsClientId = "client"
+			cfg.StsAudience = "audience"
+			cfg.TLSMinVersion = "1.2"
+			p := newProvider(cfg)
+
+			first := p.getOrBuildStsConfig(context.Background(), snap, cfg)
+			s.Require().NotNil(first)
+			s.Equal("1.2", first.TLSMinVersion)
+
+			cfg.TLSMinVersion = "1.3"
+			second := p.getOrBuildStsConfig(context.Background(), snap, cfg)
+			s.Require().NotNil(second)
+			s.NotSame(first, second)
+			s.Equal("1.3", second.TLSMinVersion)
+		})
+
+		s.Run("tls_cipher_suites", func() {
+			snap := s.newSnapshot()
+			cfg := config.Default()
+			cfg.TokenExchangeStrategy = tokenexchange.StrategyRFC8693
+			cfg.StsClientId = "client"
+			cfg.StsAudience = "audience"
+			cfg.TLSCipherSuites = []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"}
+			p := newProvider(cfg)
+
+			first := p.getOrBuildStsConfig(context.Background(), snap, cfg)
+			s.Require().NotNil(first)
+
+			cfg.TLSCipherSuites = []string{"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"}
+			second := p.getOrBuildStsConfig(context.Background(), snap, cfg)
+			s.Require().NotNil(second)
+			s.NotSame(first, second)
+			s.Equal([]string{"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"}, second.TLSCipherSuites)
+		})
 	})
 
 	s.Run("wires require_tls enforcement into the built config", func() {
@@ -294,10 +338,11 @@ func (s *TokenExchangingProviderSuite) newExchangeTestOIDCServer() *exchangeTest
 		case "/token":
 			s.Require().NoError(r.ParseForm())
 			authServer.record(observedTokenRequest{
-				clientID:     r.PostForm.Get(tokenexchange.FormKeyClientID),
-				clientSecret: r.PostForm.Get(tokenexchange.FormKeyClientSecret),
-				audience:     r.PostForm.Get(tokenexchange.FormKeyAudience),
-				scope:        strings.TrimSpace(r.PostForm.Get(tokenexchange.FormKeyScope)),
+				clientID:         r.PostForm.Get(tokenexchange.FormKeyClientID),
+				clientSecret:     r.PostForm.Get(tokenexchange.FormKeyClientSecret),
+				audience:         r.PostForm.Get(tokenexchange.FormKeyAudience),
+				scope:            strings.TrimSpace(r.PostForm.Get(tokenexchange.FormKeyScope)),
+				subjectTokenType: r.PostForm.Get(tokenexchange.FormKeySubjectTokenType),
 			})
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"access_token":"exchanged-token","token_type":"Bearer","expires_in":3600}`))

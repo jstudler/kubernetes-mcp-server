@@ -30,9 +30,9 @@ func InitGetMetrics() []api.ServerTool {
 						Type:        "string",
 						Description: "Namespace to get metrics from",
 					},
-					"clusterName": {
+					"meshCluster": {
 						Type:        "string",
-						Description: "Cluster name to get metrics from. Optional, defaults to the cluster name in the Kiali configuration (KubeConfig)",
+						Description: meshClusterDescription(),
 					},
 					"resourceName": {
 						Type:        "string",
@@ -56,9 +56,8 @@ func InitGetMetrics() []api.ServerTool {
 					},
 					"reporter": {
 						Type:        "string",
-						Description: "Metrics reporter. Optional, defaults to 'source'",
+						Description: "Metrics reporter(s). Comma-separated list of: 'source', 'destination', 'waypoint', or the special value 'both' (no reporter filter). Optional, defaults to 'source'. Example: 'source,waypoint'",
 						Default:     api.ToRawMessage(DefaultReporter),
-						Enum:        []any{"source", "destination", "both"},
 					},
 					"requestProtocol": {
 						Type:        "string",
@@ -92,7 +91,7 @@ func InitGetMetrics() []api.ServerTool {
 func resourceMetricsHandler(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	kiali := kialiclient.NewKiali(params, params.RESTConfig())
 	arguments := params.GetArguments()
-	content, err := kiali.ExecuteRequest(params.Context, KialiGetMetricsEndpoint, arguments)
+	content, err := kiali.ExecuteRequest(params.Context, KialiGetMetricsEndpoint, remapMeshCluster(arguments))
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to retrieve metrics: %w", err)), nil
 	}

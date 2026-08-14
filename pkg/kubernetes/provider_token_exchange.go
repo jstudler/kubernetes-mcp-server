@@ -5,12 +5,12 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 	"github.com/containers/kubernetes-mcp-server/pkg/oauth"
 	"github.com/containers/kubernetes-mcp-server/pkg/tokenexchange"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/klog/v2"
 )
 
 type tokenExchangingProvider struct {
@@ -71,7 +71,7 @@ func (p *tokenExchangingProvider) baseConfig() api.BaseConfig {
 // getOrBuildStsConfig returns a cached STS config, rebuilding it when the
 // OIDC provider's token URL or STS/TLS config fields change.
 func (p *tokenExchangingProvider) getOrBuildStsConfig(ctx context.Context, snap *oauth.Snapshot, baseConfig api.BaseConfig) *tokenexchange.TargetTokenExchangeConfig {
-	logger := klog.FromContext(ctx)
+	logger := klogutil.FromContext(ctx)
 
 	strategy := baseConfig.GetStsStrategy()
 	if strategy == "" {
@@ -110,12 +110,15 @@ func (p *tokenExchangingProvider) getOrBuildStsConfig(ctx context.Context, snap 
 		ClientID:           baseConfig.GetStsClientId(),
 		ClientSecret:       baseConfig.GetStsClientSecret(),
 		Audience:           baseConfig.GetStsAudience(),
+		SubjectTokenType:   tokenexchange.TokenTypeAccessToken,
 		Scopes:             scopes,
 		AuthStyle:          authStyle,
 		ClientCertFile:     baseConfig.GetStsClientCertFile(),
 		ClientKeyFile:      baseConfig.GetStsClientKeyFile(),
 		FederatedTokenFile: baseConfig.GetStsFederatedTokenFile(),
 		CAFile:             baseConfig.GetCertificateAuthority(),
+		TLSMinVersion:      baseConfig.GetTLSMinVersionConfig(),
+		TLSCipherSuites:    append([]string(nil), baseConfig.GetTLSCipherSuitesConfig()...),
 	}
 	cfg.SetRequireTLS(baseConfig.IsRequireTLS)
 	if err := cfg.Validate(); err != nil {
@@ -148,6 +151,8 @@ type stsConfigCacheKey struct {
 	ClientKeyFile      string
 	FederatedTokenFile string
 	CAFile             string
+	TLSMinVersion      string
+	TLSCipherSuites    string
 	RequireTLS         bool
 }
 
@@ -164,12 +169,10 @@ func newStsConfigCacheKey(tokenURL string, cfg api.BaseConfig) stsConfigCacheKey
 		ClientKeyFile:      cfg.GetStsClientKeyFile(),
 		FederatedTokenFile: cfg.GetStsFederatedTokenFile(),
 		CAFile:             cfg.GetCertificateAuthority(),
+		TLSMinVersion:      cfg.GetTLSMinVersionConfig(),
+		TLSCipherSuites:    strings.Join(cfg.GetTLSCipherSuitesConfig(), "\x00"),
 		RequireTLS:         cfg.IsRequireTLS(),
 	}
-}
-
-func (p *tokenExchangingProvider) IsOpenShift(ctx context.Context) bool {
-	return p.provider.IsOpenShift(ctx)
 }
 
 func (p *tokenExchangingProvider) IsMultiTarget() bool {
@@ -196,6 +199,10 @@ func (p *tokenExchangingProvider) Close() {
 	p.provider.Close()
 }
 
-func (p *tokenExchangingProvider) HasGVKs(ctx context.Context, gvks []schema.GroupVersionKind) bool {
-	return p.provider.HasGVKs(ctx, gvks)
+func (p *tokenExchangingProvider) AnyTargetHasGVKs(ctx context.Context, gvks []schema.GroupVersionKind) bool {
+	return p.provider.AnyTargetHasGVKs(ctx, gvks)
+}
+
+func (p *tokenExchangingProvider) IsTargetCompatibilityToolFiltersEnabled() bool {
+	return p.provider.IsTargetCompatibilityToolFiltersEnabled()
 }

@@ -10,9 +10,17 @@ This reference focuses on TOML file configuration. For CLI arguments, see the [C
 
 ## Table of Contents
 
+- [Table of Contents](#table-of-contents)
 - [Configuration Loading](#configuration-loading)
+  - [Usage](#usage)
 - [Drop-in Configuration](#drop-in-configuration)
+  - [How Drop-in Files Work](#how-drop-in-files-work)
+  - [Example Directory Structure](#example-directory-structure)
+  - [Example Drop-in Files](#example-drop-in-files)
 - [Dynamic Configuration Reload](#dynamic-configuration-reload)
+  - [How to Reload](#how-to-reload)
+  - [What Gets Reloaded](#what-gets-reloaded)
+  - [Limitations](#limitations)
 - [Configuration Reference](#configuration-reference-1)
   - [Server Settings](#server-settings)
   - [HTTP Server Security](#http-server-security)
@@ -31,16 +39,18 @@ This reference focuses on TOML file configuration. For CLI arguments, see the [C
   - [Confirmation Rules](#confirmation-rules)
   - [Response Mask Rules](#response-mask-rules)
   - [Toolset-Specific Configuration](#toolset-specific-configuration)
+    - [Helm Configuration](#helm-configuration)
   - [Cluster Provider Configuration](#cluster-provider-configuration)
 - [CLI Configuration Options](#cli-configuration-options)
 - [Complete Example](#complete-example)
+- [Related Documentation](#related-documentation)
 
 ## Configuration Loading
 
 Configuration values are loaded and merged in the following order (later sources override earlier ones):
 
 1. **Internal Defaults** - Built-in default values
-2. **Main Configuration File** - Loaded via `--config` flag
+2. **Main Configuration File** - Loaded via `--config` flag or `$K8S_MCP_CONFIG_PATH` (the flag takes precedence)
 3. **Drop-in Files** - Loaded from `--config-dir` in lexical (alphabetical) order
 
 ### Usage
@@ -48,6 +58,8 @@ Configuration values are loaded and merged in the following order (later sources
 ```bash
 # Use a main configuration file
 kubernetes-mcp-server --config /etc/kubernetes-mcp-server/config.toml
+# or
+K8S_MCP_CONFIG_PATH=/etc/kubernetes-mcp-server/config.toml kubernetes-mcp-server
 
 # Use only drop-in configuration files (no main config)
 kubernetes-mcp-server --config-dir /etc/kubernetes-mcp-server/conf.d/
@@ -134,12 +146,15 @@ The server will:
 | `log_level` | integer | `0` | Logging verbosity level (0-9). Higher values produce more verbose output. Similar to [kubectl logging levels](https://kubernetes.io/docs/reference/kubectl/quick-reference/#kubectl-output-verbosity-and-debugging). |
 | `log_file` | string | `""` | Path to a server log file. Required for logging in stdio mode (where stdout is reserved for the MCP protocol); replaces stdout logging in HTTP mode. The file is created if it does not exist and opened in append mode (`O_APPEND`, `0o600`). Use the special value `stderr` to route logs to stderr without opening a file. |
 | `port` | string | `""` | When set, starts the MCP server in HTTP mode (Streamable HTTP at `/mcp`, SSE at `/sse`) on the specified port. |
+| `bind_address` | string | `"0.0.0.0"` | Address to bind the HTTP server to. Set to `127.0.0.1` to restrict to localhost. A warning is logged when listening on all interfaces (`0.0.0.0` or `::`) without TLS or OAuth. |
 | `sse_base_url` | string | `""` | Base URL for Server-Sent Events (SSE) connections. Used when the server is behind a reverse proxy. |
 | `list_output` | string | `"table"` | Output format for resource list operations. Valid values: `yaml`, `table`. |
 | `stateless` | boolean | `false` | When `true`, disables tool and prompt change notifications. Useful for container deployments, load balancing, and serverless environments. |
 | `tls_cert` | string | `""` | Path to TLS certificate file for HTTPS. When set along with `tls_key`, the server serves HTTPS instead of HTTP. |
 | `tls_key` | string | `""` | Path to TLS private key file for HTTPS. Must be set together with `tls_cert`. |
 | `require_tls` | boolean | `false` | When `true`, enforces TLS for all connections. Server refuses to start without TLS certificates, and outbound connections to non-HTTPS endpoints (e.g., Kiali) are rejected. |
+| `tls_min_version` | string | `""` | Minimum TLS version (e.g., `"1.2"`, `"1.3"`; `"1.0"` and `"1.1"` are accepted for operator parity but not recommended). Defaults to TLS 1.2 if not set. Can be overridden by `TLS_MIN_VERSION`. Applies to inbound HTTPS and outbound clients (Kiali, NetObserv, OAuth, token exchange, well-known metadata). |
+| `tls_cipher_suites` | array | `[]` | TLS 1.2 cipher suites (TLS 1.3 cipher suites are not configurable). If empty, Go's defaults are used. Can be overridden by `TLS_CIPHER_SUITES` (comma-separated). Applies to inbound HTTPS and outbound clients. |
 
 **Example:**
 ```toml
@@ -155,7 +170,42 @@ tls_key = "/etc/tls/tls.key"
 
 # Enforce TLS for all connections (requires tls_cert and tls_key)
 require_tls = true
+
+# Global TLS version and cipher suites (inbound + outbound; env vars override)
+tls_min_version = "1.2"
+tls_cipher_suites = [
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+]
 ```
+
+**TLS Environment Variables:**
+
+`TLS_MIN_VERSION` and `TLS_CIPHER_SUITES` configure TLS for **both** inbound and outbound connections. When set, they override the corresponding global TOML values (`tls_min_version`, `tls_cipher_suites`):
+
+| Setting | Inbound (HTTP server) | Outbound (Kiali, NetObserv, OAuth, token exchange, well-known metadata) |
+|---------|----------------------|-------------------------------------------------------------------------|
+| `tls_min_version` / `tls_cipher_suites` (TOML) | ✅ fallback | ✅ fallback |
+| `TLS_MIN_VERSION` / `TLS_CIPHER_SUITES` (env) | ✅ overrides TOML (at startup) | ✅ overrides TOML |
+
+When neither TOML nor env is set, both inbound and outbound default to TLS 1.2 with Go's default cipher suites.
+
+> **Note:** Inbound HTTPS (`tls_min_version`, `tls_cipher_suites`, and their env overrides) is applied when the server starts. Changing these settings requires a **process restart**; they are not updated on SIGHUP config reload. Outbound clients (OAuth, token exchange, well-known metadata) pick up changes on reload; Kiali and NetObserv re-read TLS settings on each tool invocation.
+
+```bash
+# Example: Enforce TLS 1.3 minimum version (inbound + outbound)
+export TLS_MIN_VERSION="1.3"
+
+# Example: Restrict TLS 1.2 cipher suites (inbound + outbound; TLS 1.3 ciphers are not configurable)
+export TLS_MIN_VERSION="1.2"
+export TLS_CIPHER_SUITES="TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+```
+
+> **Note:** TLS 1.3 uses a fixed set of cipher suites that cannot be configured. The `TLS_CIPHER_SUITES` setting only affects TLS 1.2 and earlier connections.
+
+> **Note:** When the minimum TLS version is below `"1.3"` and you set a custom cipher list, include at least one HTTP/2-compatible suite (for example, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`). Omitting it can break HTTPS/HTTP2 clients even when TLS 1.2 handshakes succeed.
+
+> **Note:** `TLS_MIN_VERSION` values `"1.0"` and `"1.1"` are accepted for operator parity with cluster-wide TLS settings but are not recommended for production use.
 
 ### HTTP Server Security
 
@@ -274,6 +324,7 @@ Control what operations the MCP server can perform on your Kubernetes cluster. T
 |-------|------|---------|-------------|
 | `read_only` | boolean | `false` | When `true`, only exposes tools annotated with `readOnlyHint=true`. Prevents any write operations on the cluster. |
 | `disable_destructive` | boolean | `false` | When `true`, disables tools annotated with `destructiveHint=true` (delete, update operations). Has no effect when `read_only` is `true`. |
+| `experimental_enable_target_compatibility_tool_filters` | boolean | `false` | Controls cluster-capability tool filtering. Tools that require API groups absent from the cluster (for example the OpenShift-only `projects_list`) are hidden. **NOTE:** This feature is experimental, and this option is subject to change or removal in a future release. |
 
 **Example:**
 ```toml
@@ -282,6 +333,9 @@ read_only = true
 
 # Or allow writes but prevent deletions
 disable_destructive = true
+
+# Probe every target for API-group compatibility
+experimental_enable_target_compatibility_tool_filters = true
 ```
 
 ### Toolsets
@@ -296,15 +350,16 @@ Toolsets group related tools together. Enable only the toolsets you need to redu
 
 <!-- AVAILABLE-TOOLSETS-START -->
 
-| Toolset  | Description                                                                                                                                                                     | Default |
-|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
-| config   | View and manage the current local Kubernetes configuration (kubeconfig)                                                                                                         | ✓       |
-| core     | Most common tools for Kubernetes management (Pods, Generic Resources, Events, etc.)                                                                                             | ✓       |
-| helm     | Tools for managing Helm charts and releases                                                                                                                                     |         |
-| kcp      | Manage kcp workspaces and multi-tenancy features                                                                                                                                |         |
-| kiali    | Most common tools for managing Kiali, check the [Kiali documentation](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/KIALI.md) for more details.            |         |
-| kubevirt | KubeVirt virtual machine management tools, check the [KubeVirt documentation](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/kubevirt.md) for more details. |         |
-| tekton   | Tekton pipeline management tools for Pipelines, PipelineRuns, Tasks, and TaskRuns.                                                                                              |         |
+| Toolset   | Description                                                                                                                                                                                                                             | Default |
+|-----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| config    | View and manage the current local Kubernetes configuration (kubeconfig)                                                                                                                                                                 | ✓       |
+| core      | Most common tools for Kubernetes management (Pods, Generic Resources, Events, etc.)                                                                                                                                                     | ✓       |
+| helm      | Tools for managing Helm charts and releases                                                                                                                                                                                             |         |
+| kcp       | Manage kcp workspaces and multi-tenancy features                                                                                                                                                                                        |         |
+| kiali     | Most common tools for managing Kiali, check the [Kiali documentation](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/KIALI.md) for more details.                                                                    |         |
+| kubevirt  | KubeVirt virtual machine management tools, check the [KubeVirt documentation](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/kubevirt.md) for more details.                                                         |         |
+| netobserv | Network observability tools backed by the NetObserv console plugin API (flows, metrics, export). Check the [NetObserv documentation](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/NETOBSERV.md) for more details. |         |
+| tekton    | Tekton pipeline management tools for Pipelines, PipelineRuns, Tasks, TaskRuns, and troubleshooting.                                                                                                                                     |         |
 
 <!-- AVAILABLE-TOOLSETS-END -->
 
@@ -760,6 +815,7 @@ The following options can be set via command-line arguments. CLI arguments overr
 | Option | Description |
 |--------|-------------|
 | `--port` | Start in HTTP mode on the specified port |
+| `--bind-address` | Address to bind the HTTP server to (default: `0.0.0.0`) |
 | `--log-level` | Logging verbosity (0-9) |
 | `--log-file` | Path to a server log file. Required for logging in stdio mode; replaces stdout logging in HTTP mode. Use `stderr` to log to the standard error stream. |
 | `--config` | Path to main TOML configuration file |
@@ -785,6 +841,7 @@ A comprehensive configuration file demonstrating all major options:
 log_level = 2
 log_file = "/var/log/kubernetes-mcp-server.log"
 port = "8080"
+bind_address = "0.0.0.0"
 list_output = "table"
 stateless = false
 

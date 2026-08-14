@@ -13,16 +13,21 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 	"github.com/containers/kubernetes-mcp-server/pkg/output"
+	"github.com/containers/kubernetes-mcp-server/pkg/tlsutil"
 	"github.com/containers/kubernetes-mcp-server/pkg/tokenexchange"
 	"github.com/containers/kubernetes-mcp-server/pkg/toolsets"
-	"k8s.io/klog/v2"
 )
 
 const (
 	DefaultDropInConfigDir = "conf.d"
+
+	// Environment variable names for TLS configuration.
+	EnvTLSMinVersion   = "TLS_MIN_VERSION"
+	EnvTLSCipherSuites = "TLS_CIPHER_SUITES"
 )
 
 // ToolOverride contains per-tool configuration overrides.
@@ -35,12 +40,13 @@ type ToolOverride struct {
 type StaticConfig struct {
 	DeniedResources []api.GroupVersionKind `toml:"denied_resources"`
 
-	LogLevel   int    `toml:"log_level,omitzero"`
-	LogFile    string `toml:"log_file,omitempty"`
-	Port       string `toml:"port,omitempty"`
-	SSEBaseURL string `toml:"sse_base_url,omitempty"`
-	KubeConfig string `toml:"kubeconfig,omitempty"`
-	ListOutput string `toml:"list_output,omitempty"`
+	LogLevel    int    `toml:"log_level,omitzero"`
+	LogFile     string `toml:"log_file,omitempty"`
+	Port        string `toml:"port,omitempty"`
+	BindAddress string `toml:"bind_address,omitempty"`
+	SSEBaseURL  string `toml:"sse_base_url,omitempty"`
+	KubeConfig  string `toml:"kubeconfig,omitempty"`
+	ListOutput  string `toml:"list_output,omitempty"`
 	// Stateless configures the MCP server to operate in stateless mode.
 	// When true, the server will not send notifications to clients (e.g., tools/list_changed, prompts/list_changed).
 	// This is useful for container deployments, load balancing, and serverless environments where
@@ -125,6 +131,12 @@ type StaticConfig struct {
 	// When true, the server will refuse to start without TLS certificates,
 	// and outbound connections to non-HTTPS endpoints will be rejected.
 	RequireTLS bool `toml:"require_tls,omitempty"`
+	// TLSMinVersion is the minimum TLS version to accept (e.g., "1.2", "1.3").
+	// Defaults to TLS 1.2 if not set. Can be overridden by TLS_MIN_VERSION env var.
+	TLSMinVersion string `toml:"tls_min_version,omitempty"`
+	// TLSCipherSuites is a list of supported cipher suites for TLS connections.
+	// If empty, Go's default cipher suites are used. Can be overridden by TLS_CIPHER_SUITES env var.
+	TLSCipherSuites []string `toml:"tls_cipher_suites,omitempty"`
 
 	// HTTP server configuration (timeouts, size limits)
 	HTTP HTTPConfig `toml:"http,omitempty"`
@@ -154,6 +166,13 @@ type StaticConfig struct {
 	// When enabled, validates resources, schemas, and RBAC before execution.
 	// Defaults to false.
 	ValidationEnabled bool `toml:"validation_enabled,omitempty"`
+
+	// EnableTargetCompatibilityToolFilters enables filtering of tools based on
+	// cluster target compatibility (e.g., hiding OpenShift-specific tools when
+	// connected to a non-OpenShift cluster). This feature is experimental, and
+	// this option is subject to change or removal in a future release.
+	// Defaults to false.
+	EnableTargetCompatibilityToolFilters bool `toml:"experimental_enable_target_compatibility_tool_filters,omitempty"`
 
 	// ConfirmationFallback is the global default fallback behavior when a client
 	// does not support elicitation. Valid values are "deny" and "allow".
@@ -201,7 +220,7 @@ func Read(ctx context.Context, configPath, dropInConfigDir string) (*StaticConfi
 	var configFiles []string
 	var configDir string
 
-	logger := klog.FromContext(ctx)
+	logger := klogutil.FromContext(ctx)
 
 	// Main config file
 	if configPath != "" {
@@ -254,7 +273,7 @@ func Read(ctx context.Context, configPath, dropInConfigDir string) (*StaticConfi
 // Files are processed in lexical (alphabetical) order.
 // Only files with .toml extension are processed; dotfiles are ignored.
 func loadDropInConfigs(ctx context.Context, dropInConfigDir string) ([]string, error) {
-	logger := klog.FromContext(ctx)
+	logger := klogutil.FromContext(ctx)
 	// Check if directory exists
 	info, err := os.Stat(dropInConfigDir)
 	if err != nil {
@@ -277,7 +296,7 @@ func loadDropInConfigs(ctx context.Context, dropInConfigDir string) ([]string, e
 // Dotfiles (starting with '.') and non-.toml files are ignored.
 // Files are sorted lexically (alphabetically) by filename.
 func getSortedConfigFiles(ctx context.Context, dir string) ([]string, error) {
-	logger := klog.FromContext(ctx)
+	logger := klogutil.FromContext(ctx)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -320,7 +339,7 @@ func readAndMergeFiles(ctx context.Context, files []string) ([]byte, error) {
 	rawConfig := map[string]interface{}{}
 	// Merge each file in order using deep merge
 	for _, file := range files {
-		klog.FromContext(ctx).V(3).Info("Merging config", "file_name", filepath.Base(file))
+		klogutil.FromContext(ctx).V(3).Info("Merging config", "file_name", filepath.Base(file))
 		configData, err := os.ReadFile(file)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read config %s: %w", file, err)
@@ -456,6 +475,10 @@ func (c *StaticConfig) IsValidationEnabled() bool {
 	return c.ValidationEnabled
 }
 
+func (c *StaticConfig) IsTargetCompatibilityToolFiltersEnabled() bool {
+	return c.EnableTargetCompatibilityToolFilters
+}
+
 func (c *StaticConfig) GetConfirmationRules() []api.ConfirmationRule {
 	return c.ConfirmationRules
 }
@@ -466,6 +489,28 @@ func (c *StaticConfig) GetConfirmationFallback() string {
 
 func (c *StaticConfig) IsRequireTLS() bool {
 	return c.RequireTLS
+}
+
+// GetTLSMinVersionConfig returns the effective tls_min_version, with TLS_MIN_VERSION
+// env var taking precedence over the TOML/CLI value.
+func (c *StaticConfig) GetTLSMinVersionConfig() string {
+	if envValue := os.Getenv(EnvTLSMinVersion); envValue != "" {
+		return envValue
+	}
+	return c.TLSMinVersion
+}
+
+// GetTLSCipherSuitesConfig returns the effective tls_cipher_suites, with
+// TLS_CIPHER_SUITES env var taking precedence over the TOML/CLI value.
+func (c *StaticConfig) GetTLSCipherSuitesConfig() []string {
+	if envValue := os.Getenv(EnvTLSCipherSuites); envValue != "" {
+		suites := strings.Split(envValue, ",")
+		for i, suite := range suites {
+			suites[i] = strings.TrimSpace(suite)
+		}
+		return suites
+	}
+	return c.TLSCipherSuites
 }
 
 func (c *StaticConfig) IsRequireOAuth() bool {
@@ -538,7 +583,7 @@ func (c *StaticConfig) Validate(ctx context.Context) error {
 		}
 		if u.Scheme == "http" {
 			klogutil.LogWarn(
-				klog.FromContext(ctx),
+				klogutil.FromContext(ctx),
 				"authorization-url is using insecure scheme, this is not recommended production use",
 				klogutil.Field("url.scheme", "http"),
 			)
@@ -564,6 +609,9 @@ func (c *StaticConfig) Validate(ctx context.Context) error {
 		if _, err := os.Stat(c.TLSKey); err != nil {
 			return fmt.Errorf("tls-key must be a valid file path: %w", err)
 		}
+	}
+	if err := c.validateTLSSettings(ctx); err != nil {
+		return err
 	}
 	if err := c.ValidateRequireTLS(); err != nil {
 		return err
@@ -611,7 +659,7 @@ func (c *StaticConfig) validateSkipJWTVerification(ctx context.Context) error {
 		return nil
 	}
 	if c.SkipJWTVerification {
-		klogutil.LogWarn(klog.FromContext(ctx),
+		klogutil.LogWarn(klogutil.FromContext(ctx),
 			"skip_jwt_verification is enabled with no authorization_url: bearer tokens will be forwarded without any local validation. "+
 				"The cluster (or a trusted upstream) is the sole authority. Only use this when cluster_auth_mode=passthrough and the cluster validates tokens directly.")
 		return nil
@@ -659,6 +707,33 @@ func (c *StaticConfig) validateTokenExchange() error {
 		}
 	default:
 		return fmt.Errorf("invalid sts_auth_style %q: must be %q, %q, %q, or %q", c.StsAuthStyle, tokenexchange.AuthStyleParams, tokenexchange.AuthStyleHeader, tokenexchange.AuthStyleAssertion, tokenexchange.AuthStyleFederated)
+	}
+	return nil
+}
+
+// validateTLSSettings validates TLS settings via the getters so env overrides are included,
+// and logs once at startup/reload when TLS env vars override TOML.
+func (c *StaticConfig) validateTLSSettings(ctx context.Context) error {
+	logger := klogutil.FromContext(ctx).V(1)
+	if os.Getenv(EnvTLSMinVersion) != "" {
+		klogutil.LogInfo(logger, "TLS min version overridden by environment variable",
+			klogutil.Field("env", EnvTLSMinVersion),
+			klogutil.Field("value", c.GetTLSMinVersionConfig()),
+		)
+	}
+	if os.Getenv(EnvTLSCipherSuites) != "" {
+		klogutil.LogInfo(logger, "TLS cipher suites overridden by environment variable",
+			klogutil.Field("env", EnvTLSCipherSuites),
+		)
+	}
+
+	minVersion := c.GetTLSMinVersionConfig()
+	if _, err := tlsutil.ParseTLSVersion(minVersion); err != nil {
+		return err
+	}
+	cipherSuites := c.GetTLSCipherSuitesConfig()
+	if _, err := tlsutil.ParseTLSCipherSuites(cipherSuites); err != nil {
+		return err
 	}
 	return nil
 }

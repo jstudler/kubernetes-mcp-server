@@ -7,10 +7,47 @@ MCP_CONFIG_DIR ?= dev/config/mcp-configs
 
 MCPCHECKER = $(shell pwd)/_output/tools/bin/mcpchecker
 MCPCHECKER_VERSION ?= latest
-EVAL_CONFIG ?= evals/openai-agent/eval.yaml
-EVAL_LABEL_SELECTOR ?= suite=kubernetes
+CLAUDE_AGENT_ACP = $(shell pwd)/_output/tools/node_modules/.bin/claude-agent-acp
+CLAUDE_AGENT_ACP_VERSION ?= latest
+JQ = $(shell pwd)/_output/tools/bin/jq
+JQ_VERSION ?= 1.7.1
+# Derive the jq release asset for the host from the Go toolchain (already a
+# dependency of this eval flow). jq names assets macos/i386 where Go says
+# darwin/386, and suffixes Windows binaries with .exe.
+JQ_GO_OS ?= $(shell go env GOHOSTOS)
+JQ_GO_ARCH ?= $(shell go env GOHOSTARCH)
+JQ_OS = $(patsubst darwin,macos,$(JQ_GO_OS))
+JQ_ARCH = $(patsubst 386,i386,$(JQ_GO_ARCH))
+JQ_ASSET = jq-$(JQ_OS)-$(JQ_ARCH)$(if $(filter windows,$(JQ_GO_OS)),.exe,)
+
+# High-level knobs for local single-suite runs, e.g.:
+#   make run-evals SUITE=kubevirt AGENT=acp-anthropic MODEL=sonnet
+# AGENT selects the agent directory under evals/, SUITE selects the task suite
+# label, and MODEL sets ANTHROPIC_MODEL for ACP agents (builtin agents ignore it).
+# Available agents: builtin-openai, builtin-anthropic, builtin-google,
+#                   acp-anthropic (Claude Code via ACP), acp-google (Gemini via ACP)
+AGENT ?= builtin-openai
+SUITE ?= core
+MODEL ?=
+
+# Prefer a per-suite eval config when one exists, then try the core-eval-testing
+# suite config (what CI uses).
+EVAL_CONFIG ?= $(or $(wildcard evals/tasks/$(SUITE)/$(AGENT)/eval.yaml),evals/core-eval-testing/$(AGENT)/eval-$(SUITE).yaml)
+EVAL_LABEL_SELECTOR ?= suite=$(SUITE)
 EVAL_TASK_FILTER ?=
 EVAL_VERBOSE ?= false
+
+# Download and install jq static binary if not already installed
+.PHONY: jq
+jq:
+	@[ -f $(JQ) ] || { \
+		set -e ;\
+		echo "Installing jq $(JQ_VERSION) ($(JQ_ASSET)) to $(JQ)..." ;\
+		mkdir -p $(shell dirname $(JQ)) ;\
+		curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-$(JQ_VERSION)/$(JQ_ASSET)" \
+			-o $(JQ) ;\
+		chmod +x $(JQ) ;\
+	}
 
 # Download and install mcpchecker if not already installed
 .PHONY: mcpchecker
@@ -24,9 +61,20 @@ mcpchecker:
 
 ##@ Evals
 
+# Install the claude-agent-acp adapter locally under _output/tools, required by
+# the acp-anthropic eval agent (runs `claude-agent-acp`).
+.PHONY: claude-agent-acp
+claude-agent-acp: ## Install the claude-agent-acp adapter for the acp-anthropic eval agent
+	@[ -f $(CLAUDE_AGENT_ACP) ] || { \
+		set -e ;\
+		echo "Installing claude-agent-acp@$(CLAUDE_AGENT_ACP_VERSION) to $(CLAUDE_AGENT_ACP)..." ;\
+		npm install --prefix $(shell pwd)/_output/tools @agentclientprotocol/claude-agent-acp@$(CLAUDE_AGENT_ACP_VERSION) ;\
+		echo "✅ claude-agent-acp installed" ;\
+	}
+
 .PHONY: run-evals
-run-evals: mcpchecker ## Run mcpchecker evaluations against the MCP server
-	$(MCPCHECKER) check $(EVAL_CONFIG) \
+run-evals: mcpchecker jq $(if $(filter acp-anthropic,$(AGENT)),claude-agent-acp) ## Run mcpchecker evals (knobs: SUITE, AGENT, MODEL; see evals/README.md)
+	$(if $(MODEL),ANTHROPIC_MODEL=$(MODEL) )PATH="$(shell pwd)/_output/tools/node_modules/.bin:$(PATH)" $(MCPCHECKER) check $(EVAL_CONFIG) \
 		$(if $(EVAL_LABEL_SELECTOR),--label-selector $(EVAL_LABEL_SELECTOR),) \
 		$(if $(EVAL_TASK_FILTER),--run "$(EVAL_TASK_FILTER)",) \
 		$(if $(filter true,$(EVAL_VERBOSE)),--verbose,) \
@@ -52,16 +100,12 @@ diff-evals: mcpchecker ## Diff latest mcpchecker results against baseline
 .PHONY: run-server
 run-server: build ## Start MCP server in background and wait for health check
 	@echo "Starting MCP server on port $(MCP_PORT)..."
-	@if [ -n "$(TOOLSETS)" ]; then \
-		./$(BINARY_NAME) --port $(MCP_PORT) --toolsets $(TOOLSETS) --config-dir $(MCP_CONFIG_DIR) & echo $$! > .mcp-server.pid; \
-	else \
-		./$(BINARY_NAME) --port $(MCP_PORT) & echo $$! > .mcp-server.pid; \
-	fi
+	./$(BINARY_NAME) --port $(MCP_PORT) $(if $(TOOLSETS),--toolsets "$(TOOLSETS)") --config-dir $(MCP_CONFIG_DIR) $(if $(MCP_EVAL_KUBECONFIG),--kubeconfig "$(MCP_EVAL_KUBECONFIG)") & echo $$! > .mcp-server.pid
 	@echo "MCP server started with PID $$(cat .mcp-server.pid)"
 	@echo "Waiting for MCP server to be ready..."
 	@elapsed=0; \
 	while [ $$elapsed -lt $(MCP_HEALTH_TIMEOUT) ]; do \
-		if curl -s http://localhost:$(MCP_PORT)/health > /dev/null 2>&1; then \
+		if curl -fsS http://localhost:$(MCP_PORT)/healthz > /dev/null 2>&1; then \
 			echo "MCP server is ready"; \
 			exit 0; \
 		fi; \

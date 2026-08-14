@@ -8,7 +8,8 @@ import (
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/confirmation"
-	"github.com/containers/kubernetes-mcp-server/pkg/mcplog"
+	"github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
+	"github.com/containers/kubernetes-mcp-server/pkg/mcplog" //nolint:staticcheck // MCP logging deprecated (SEP-2577)
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"k8s.io/utils/ptr"
@@ -79,16 +80,20 @@ func ServerToolToGoSdkTool(s *Server, tool api.ServerTool) (*mcp.Tool, mcp.ToolH
 		cluster := toolCallRequest.GetString(s.p.GetTargetParameterName(), s.p.GetDefaultTarget())
 		k, err := s.p.GetDerivedKubernetes(ctx, cluster)
 		if err != nil {
+			if errors.Is(err, kubernetes.ErrUnknownTarget) {
+				return NewTextResult("", fmt.Errorf("target %q: %w", cluster, err)), nil
+			}
 			return nil, err
 		}
 
 		result, err := tool.Handler(api.ToolHandlerParams{
-			Context:          ctx,
-			BaseConfig:       cfg,
-			KubernetesClient: k,
-			ToolCallRequest:  toolCallRequest,
-			ListOutput:       cfg.ListOutput(),
-			Elicitor:         &sessionElicitor{},
+			Context:           ctx,
+			BaseConfig:        cfg,
+			KubernetesClient:  k,
+			FilteringProvider: s.p,
+			ToolCallRequest:   toolCallRequest,
+			ListOutput:        cfg.ListOutput(),
+			Elicitor:          &sessionElicitor{},
 		})
 		if err != nil {
 			return nil, err

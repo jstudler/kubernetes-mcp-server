@@ -18,7 +18,7 @@ func InitGetLogs() []api.ServerTool {
 	ret = append(ret, api.ServerTool{
 		Tool: api.Tool{
 			Name:        name,
-			Description: "Get the logs of a Kubernetes Pod (or workload name that will be resolved to a pod) in a namespace. Output is plain text, matching kubernetes-mcp-server pods_log.",
+			Description: "Get the logs of a Kubernetes Pod (or workload name that will be resolved to a pod) in a namespace. Output is plain text, matching kubernetes-mcp-server pods_log. The line_count field tells you the total number of log lines returned. Analyze ALL of them, but summarize the results unless the user explicitly asks for the raw output. Do not omit any error or warning lines.",
 			InputSchema: &jsonschema.Schema{
 				Type: "object",
 				Properties: map[string]*jsonschema.Schema{
@@ -57,9 +57,9 @@ func InitGetLogs() []api.ServerTool {
 						Description: "Output formatting for chat. 'codeblock' wraps logs in ~~~ fences (recommended). 'plain' returns raw text like kubernetes-mcp-server pods_log.",
 						Enum:        []any{"codeblock", "plain"},
 					},
-					"clusterName": {
+					"meshCluster": {
 						Type:        "string",
-						Description: "Optional. Name of the cluster to get the logs from. If not provided, will use the default cluster name in the Kiali KubeConfig",
+						Description: meshClusterDescription(),
 					},
 				},
 				Required: []string{"namespace", "name"},
@@ -80,7 +80,7 @@ func InitGetLogs() []api.ServerTool {
 func workloadLogsHandler(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	kiali := kialiclient.NewKiali(params, params.RESTConfig())
 	arguments := params.GetArguments()
-	content, err := kiali.ExecuteRequest(params.Context, KialiGetLogsEndpoint, arguments)
+	content, err := kiali.ExecuteRequest(params.Context, KialiGetLogsEndpoint, remapMeshCluster(arguments))
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to get logs: %w", err)), nil
 	}

@@ -13,13 +13,13 @@ import (
 	"github.com/spf13/cobra"
 
 	"k8s.io/cli-runtime/pkg/genericiooptions"
-	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	internalhttp "github.com/containers/kubernetes-mcp-server/pkg/http"
+	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 	"github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
 	"github.com/containers/kubernetes-mcp-server/pkg/logging"
 	"github.com/containers/kubernetes-mcp-server/pkg/mcp"
@@ -58,6 +58,11 @@ kubernetes-mcp-server --cluster-provider kubeconfig
 # start with kcp cluster provider for multi-workspace support
 kubernetes-mcp-server --cluster-provider kcp
 `))
+
+	// config_path_env_var is the name of an environment variable whose value
+	// is the path to the main configuration TOML file. It is ignored if
+	// `--config` is provided on the command line.
+	config_path_env_var = "K8S_MCP_CONFIG_PATH"
 )
 
 const (
@@ -67,6 +72,7 @@ const (
 	flagConfig               = "config"
 	flagConfigDir            = "config-dir"
 	flagPort                 = "port"
+	flagBindAddress          = "bind-address"
 	flagSSEBaseUrl           = "sse-base-url"
 	flagKubeconfig           = "kubeconfig"
 	flagToolsets             = "toolsets"
@@ -92,6 +98,7 @@ type MCPServerOptions struct {
 	LogLevel             int
 	LogFile              string
 	Port                 string
+	BindAddress          string
 	SSEBaseUrl           string
 	Kubeconfig           string
 	Toolsets             []string
@@ -127,6 +134,8 @@ func NewMCPServerOptions(streams genericiooptions.IOStreams) *MCPServerOptions {
 }
 
 func NewMCPServer(streams genericiooptions.IOStreams) *cobra.Command {
+	// Allow downstreams to customize variable values
+	varOverrides()
 	o := NewMCPServerOptions(streams)
 	cmd := &cobra.Command{
 		Use:     "kubernetes-mcp-server [command] [options]",
@@ -141,10 +150,11 @@ func NewMCPServer(streams genericiooptions.IOStreams) *cobra.Command {
 			// Close the log sink whatever happens next: Validate may fail, Run
 			// may panic, the version short-circuit may exit early. The sink is
 			// the only thing that holds an open fd between Complete and now.
+			// Close also flushes the OTel log provider when configured.
 			defer func() {
 				if o.logSink != nil {
 					if err := o.logSink.Close(); err != nil {
-						klog.FromContext(ctx).Error(err, "failed to close log sink")
+						klogutil.FromContext(ctx).Error(err, "failed to close log sink")
 					}
 				}
 			}()
@@ -165,6 +175,7 @@ func NewMCPServer(streams genericiooptions.IOStreams) *cobra.Command {
 	cmd.Flags().StringVar(&o.ConfigPath, flagConfig, o.ConfigPath, "Path of the config file.")
 	cmd.Flags().StringVar(&o.ConfigDir, flagConfigDir, o.ConfigDir, "Path to drop-in configuration directory (files loaded in lexical order). Defaults to "+config.DefaultDropInConfigDir+" relative to the config file if --config is set.")
 	cmd.Flags().StringVar(&o.Port, flagPort, o.Port, "Start a streamable HTTP and SSE HTTP server on the specified port (e.g. 8080)")
+	cmd.Flags().StringVar(&o.BindAddress, flagBindAddress, o.BindAddress, "Address to bind the HTTP server to (e.g. 127.0.0.1). Defaults to 0.0.0.0 (all interfaces)")
 	cmd.Flags().StringVar(&o.SSEBaseUrl, flagSSEBaseUrl, o.SSEBaseUrl, "SSE public base URL to use when sending the endpoint message (e.g. https://example.com)")
 	cmd.Flags().StringVar(&o.Kubeconfig, flagKubeconfig, o.Kubeconfig, "Path to the kubeconfig file to use for authentication")
 	cmd.Flags().StringSliceVar(&o.Toolsets, flagToolsets, o.Toolsets, "Comma-separated list of MCP toolsets to use (available toolsets: "+strings.Join(toolsets.ToolsetNames(), ", ")+"). Defaults to "+strings.Join(o.StaticConfig.Toolsets, ", ")+".")
@@ -194,6 +205,11 @@ func NewMCPServer(streams genericiooptions.IOStreams) *cobra.Command {
 }
 
 func (m *MCPServerOptions) Complete(ctx context.Context, cmd *cobra.Command) error {
+	// If ConfigPath was not provided on the CLI, allow an env var to specify it.
+	if cp := os.Getenv(config_path_env_var); m.ConfigPath == "" && cp != "" {
+		m.ConfigPath = cp
+	}
+
 	if m.ConfigPath != "" || m.ConfigDir != "" {
 		cnf, err := config.Read(ctx, m.ConfigPath, m.ConfigDir)
 		if err != nil {
@@ -204,11 +220,30 @@ func (m *MCPServerOptions) Complete(ctx context.Context, cmd *cobra.Command) err
 
 	m.loadFlags(cmd)
 
-	sink, err := logging.New(m.StaticConfig, m.Out, m.ErrOut)
+	// Initialize the OTel log provider before wiring klog. This runs before
+	// klog is configured, so it does not use klog internally. If it fails or
+	// telemetry is disabled, otelLogProvider is nil and logging proceeds
+	// text-only.
+	otelLogProvider, otelLogErr := telemetry.NewLogProvider(
+		ctx, &m.StaticConfig.Telemetry, version.BinaryName, version.Version,
+	)
+
+	var sinkOpts []logging.Option
+	if otelLogProvider != nil {
+		otelSink := telemetry.NewLogSink(version.BinaryName, version.Version, otelLogProvider)
+		sinkOpts = append(sinkOpts, logging.WithOtelLogSink(otelSink, otelLogProvider))
+	}
+
+	sink, err := logging.New(m.StaticConfig, m.Out, m.ErrOut, sinkOpts...)
 	if err != nil {
 		return err
 	}
 	m.logSink = sink
+
+	// klog is now wired — log the deferred OTel provider error if one occurred.
+	if otelLogErr != nil {
+		klogutil.FromContext(ctx).Error(otelLogErr, "Failed to create OTel log provider, log export disabled")
+	}
 
 	if m.StaticConfig.RequireOAuth && m.StaticConfig.Port == "" {
 		// RequireOAuth is not relevant flow for STDIO transport
@@ -227,6 +262,9 @@ func (m *MCPServerOptions) loadFlags(cmd *cobra.Command) {
 	}
 	if cmd.Flag(flagPort).Changed {
 		m.StaticConfig.Port = m.Port
+	}
+	if cmd.Flag(flagBindAddress).Changed {
+		m.StaticConfig.BindAddress = m.BindAddress
 	}
 	if cmd.Flag(flagSSEBaseUrl).Changed {
 		m.StaticConfig.SSEBaseURL = m.SSEBaseUrl
@@ -314,7 +352,7 @@ func (m *MCPServerOptions) Run(ctx context.Context) error {
 		strategy = "auto-detect (it is recommended to set this explicitly in your Config)"
 	}
 
-	klog.FromContext(ctx).V(1).Info("Starting kubernetes-mcp-server",
+	klogutil.FromContext(ctx).V(1).Info("Starting kubernetes-mcp-server",
 		"config.path", m.ConfigPath,
 		"config.toolsets", m.StaticConfig.Toolsets,
 		"config.list_output", m.StaticConfig.ListOutput,
@@ -360,7 +398,7 @@ func (m *MCPServerOptions) Run(ctx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := mcpServer.Shutdown(shutdownCtx); err != nil {
-			klog.Errorf("MCP server shutdown error: %v", err)
+			klogutil.FromContext(ctx).Error(err, "MCP server shutdown error")
 		}
 	}()
 
@@ -397,7 +435,7 @@ func (m *MCPServerOptions) setupSIGHUPHandler(
 	done := make(chan struct{})
 	signal.Notify(sigHupCh, syscall.SIGHUP)
 
-	logger := klog.FromContext(ctx)
+	logger := klogutil.FromContext(ctx)
 
 	go func() {
 		defer close(done)

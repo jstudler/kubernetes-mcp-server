@@ -18,6 +18,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Configuration: View"
@@ -38,6 +39,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Events: List"
@@ -67,6 +69,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Namespaces: List"
@@ -92,6 +95,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Node: Log"
@@ -130,6 +134,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Node: Stats Summary"
@@ -189,6 +194,7 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": true,
+      "readOnlyHint": false,
       "title": "Pods: Delete"
     },
     "description": "Delete a Kubernetes Pod in the current or provided namespace with the provided name",
@@ -218,7 +224,9 @@
   {
     "annotations": {
       "destructiveHint": true,
+      "idempotentHint": false,
       "openWorldHint": true,
+      "readOnlyHint": false,
       "title": "Pods: Exec"
     },
     "description": "Execute a command in a Kubernetes Pod (shell access, run commands in container) in the current or provided namespace with the provided name and command",
@@ -260,6 +268,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Pods: Get"
@@ -291,6 +300,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Pods: List"
@@ -321,6 +331,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Pods: List in Namespace"
@@ -358,6 +369,7 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Pods: Log"
@@ -403,7 +415,9 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
+      "readOnlyHint": false,
       "title": "Pods: Run"
     },
     "description": "Run a Kubernetes Pod in the current or provided namespace with the provided container image and optional name",
@@ -479,12 +493,34 @@
   },
   {
     "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true,
+      "title": "Projects: List"
+    },
+    "description": "List all the OpenShift projects in the current cluster",
+    "inputSchema": {
+      "properties": {
+        "context": {
+          "description": "Optional parameter selecting which context to run the tool in. Defaults to fake-context if not set",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "projects_list",
+    "title": "Projects: List"
+  },
+  {
+    "annotations": {
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": true,
+      "readOnlyHint": false,
       "title": "Resources: Create or Update"
     },
-    "description": "Create or update a Kubernetes resource in the current cluster by providing a YAML or JSON representation of the resource\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress)",
+    "description": "Create or update a Kubernetes resource via Server-Side Apply. The manifest is the complete desired state: any field this tool previously set and the new manifest omits is removed. To edit an existing resource, fetch it with resources_get, modify it, then re-apply the full resource.\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress, route.openshift.io/v1 Route)",
     "inputSchema": {
       "properties": {
         "context": {
@@ -492,7 +528,7 @@
           "type": "string"
         },
         "resource": {
-          "description": "A JSON or YAML containing a representation of the Kubernetes resource. Should include top-level fields such as apiVersion,kind,metadata, and spec",
+          "description": "Complete YAML or JSON representation of the Kubernetes resource (full desired state, not a partial patch). Include apiVersion, kind, metadata, and the full spec.",
           "type": "string"
         }
       },
@@ -509,9 +545,10 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": true,
+      "readOnlyHint": false,
       "title": "Resources: Delete"
     },
-    "description": "Delete a Kubernetes resource in the current cluster by providing its apiVersion, kind, optionally the namespace, and its name\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress)",
+    "description": "Delete a Kubernetes resource in the current cluster by providing its apiVersion, kind, optionally the namespace, and its name\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress, route.openshift.io/v1 Route)",
     "inputSchema": {
       "properties": {
         "apiVersion": {
@@ -552,11 +589,12 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Resources: Get"
     },
-    "description": "Get a Kubernetes resource in the current cluster by providing its apiVersion, kind, optionally the namespace, and its name\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress)",
+    "description": "Get a Kubernetes resource in the current cluster by providing its apiVersion, kind, optionally the namespace, and its name\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress, route.openshift.io/v1 Route)",
     "inputSchema": {
       "properties": {
         "apiVersion": {
@@ -593,11 +631,12 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": true,
       "title": "Resources: List"
     },
-    "description": "List Kubernetes resources and objects in the current cluster by providing their apiVersion and kind and optionally the namespace and label selector\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress)",
+    "description": "List Kubernetes resources and objects in the current cluster by providing their apiVersion and kind and optionally the namespace and label selector\n(common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress, route.openshift.io/v1 Route)",
     "inputSchema": {
       "properties": {
         "apiVersion": {
@@ -641,6 +680,7 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": true,
+      "readOnlyHint": false,
       "title": "Resources: Scale"
     },
     "description": "Get or update the scale of a Kubernetes resource in the current cluster by providing its apiVersion, kind, name, and optionally the namespace. If the scale is set in the tool call, the scale will be updated to that value. Always returns the current scale of the resource",

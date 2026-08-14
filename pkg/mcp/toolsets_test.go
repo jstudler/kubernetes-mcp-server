@@ -40,6 +40,8 @@ type ToolsetsSuite struct {
 func (s *ToolsetsSuite) SetupTest() {
 	s.originalToolsets = toolsets.Toolsets()
 	s.MockServer = test.NewMockServer()
+	// Set up default discovery handler for non-OpenShift cluster
+	s.Handle(test.NewDiscoveryClientHandler())
 	s.Cfg = configuration.BaseDefault()
 	s.Cfg.KubeConfig = s.KubeconfigFile(s.T())
 	s.updateJson = os.Getenv(updateJsonEnvVar) != ""
@@ -92,6 +94,8 @@ func (s *ToolsetsSuite) TestDefaultToolsetsTools() {
 
 func (s *ToolsetsSuite) TestDefaultToolsetsToolsInOpenShift() {
 	s.Run("Default configuration toolsets in OpenShift", func() {
+		// Replace default handler with OpenShift handler
+		s.ResetHandlers()
 		s.Handle(test.NewInOpenShiftHandler())
 		s.InitMcpClient()
 		tools, err := s.ListTools()
@@ -101,6 +105,44 @@ func (s *ToolsetsSuite) TestDefaultToolsetsToolsInOpenShift() {
 		})
 		s.Run("ListTools returns correct Tool metadata", func() {
 			s.assertJsonSnapshot("toolsets-full-tools-openshift.json", tools.Tools)
+		})
+	})
+}
+
+func (s *ToolsetsSuite) TestDefaultToolsetsToolsWithFilteringEnabled() {
+	s.Run("Default configuration toolsets with filtering enabled on non-OpenShift", func() {
+		s.Cfg.EnableTargetCompatibilityToolFilters = true
+		s.InitMcpClient()
+		tools, err := s.ListTools()
+		s.Run("ListTools returns tools", func() {
+			s.NotNil(tools, "Expected tools from ListTools")
+			s.NoError(err, "Expected no error from ListTools")
+		})
+		s.Run("projects_list tool is not present", func() {
+			for _, tool := range tools.Tools {
+				s.Require().NotEqual("projects_list", tool.Name, "Expected projects_list to not be present when filtering enabled on non-OpenShift cluster")
+			}
+		})
+	})
+}
+
+func (s *ToolsetsSuite) TestKubevirtToolsFilteredWithoutCRDs() {
+	s.Run("Kubevirt tools are filtered out when VirtualMachine GVK is not present", func() {
+		s.Cfg.Toolsets = []string{"kubevirt"}
+		s.Cfg.EnableTargetCompatibilityToolFilters = true
+		s.InitMcpClient()
+		tools, err := s.ListTools()
+		s.Run("ListTools returns tools", func() {
+			s.NotNil(tools, "Expected tools from ListTools")
+			s.NoError(err, "Expected no error from ListTools")
+		})
+		s.Run("kubevirt tools are not present", func() {
+			kubevirtTools := []string{"vm_create", "vm_lifecycle", "vm_clone", "vm_guest_info"}
+			for _, tool := range tools.Tools {
+				for _, kvTool := range kubevirtTools {
+					s.Require().NotEqual(kvTool, tool.Name, "Expected %s to not be present when filtering enabled on cluster without KubeVirt", kvTool)
+				}
+			}
 		})
 	})
 }

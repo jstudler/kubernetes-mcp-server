@@ -87,9 +87,21 @@ type ValidationEnabledProvider interface {
 	IsValidationEnabled() bool
 }
 
+// TargetCompatibilityToolFiltersEnabledProvider provides access to target compatibility tool filters setting.
+type TargetCompatibilityToolFiltersEnabledProvider interface {
+	IsTargetCompatibilityToolFiltersEnabled() bool
+}
+
 // RequireTLSProvider provides access to require_tls setting.
 type RequireTLSProvider interface {
 	IsRequireTLS() bool
+}
+
+// TLSConfigProvider provides access to global TLS min version and cipher suite settings.
+// Values include TLS_MIN_VERSION and TLS_CIPHER_SUITES env overrides when set.
+type TLSConfigProvider interface {
+	GetTLSMinVersionConfig() string
+	GetTLSCipherSuitesConfig() []string
 }
 
 // RequireOAuthProvider provides access to require_oauth setting.
@@ -142,7 +154,9 @@ type BaseConfig interface {
 	StsConfigProvider
 	CertificateAuthorityProvider
 	ValidationEnabledProvider
+	TargetCompatibilityToolFiltersEnabledProvider
 	RequireTLSProvider
+	TLSConfigProvider
 	RequireOAuthProvider
 	ResponseFilterProvider
 }
