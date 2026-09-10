@@ -14,7 +14,6 @@ import (
 
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
-	internalk8s "github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
 	"github.com/containers/kubernetes-mcp-server/pkg/oauth"
 )
 
@@ -58,22 +57,16 @@ func AuthorizationMiddleware(cfgState *config.StaticConfigState, oauthState *oau
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			logger := klogutil.FromContext(r.Context())
-			// Skip auth for infrastructure endpoints (health, metrics) and well-known endpoints
-			if slices.Contains(infraPaths, r.URL.Path) || isWellKnownPath(r.URL.EscapedPath()) {
-				next.ServeHTTP(w, r)
-				return
-			}
 			// Load the latest config snapshot on every request so that
 			// SIGHUP-reloaded auth settings take effect immediately.
 			staticConfig := cfgState.Load()
+			// Skip auth for infrastructure endpoints (health, metrics) and well-known endpoints.
+			// When metrics are on a separate port, only /healthz is exempt on the main port.
+			if slices.Contains(infraPaths(staticConfig.MetricsPort != ""), r.URL.Path) || isWellKnownPath(r.URL.EscapedPath()) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			if !staticConfig.RequireOAuth {
-				// Always extract the Authorization header so it can be forwarded
-				// to the cluster, even without OAuth validation.
-				if authHeader := r.Header.Get("Authorization"); authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
-					ctx := context.WithValue(r.Context(), internalk8s.OAuthAuthorizationHeader, authHeader)
-					next.ServeHTTP(w, r.WithContext(ctx))
-					return
-				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -113,8 +106,7 @@ func AuthorizationMiddleware(cfgState *config.StaticConfigState, oauthState *oau
 				skipJWTWarningOnce.Do(func() {
 					klogutil.LogWarn(logger, "Bearer token forwarded without local validation (skip_jwt_verification=true and no authorization_url) - the cluster is the sole authority")
 				})
-				ctx := context.WithValue(r.Context(), internalk8s.OAuthAuthorizationHeader, authHeader)
-				next.ServeHTTP(w, r.WithContext(ctx))
+				next.ServeHTTP(w, r)
 				return
 			}
 
@@ -166,10 +158,7 @@ func AuthorizationMiddleware(cfgState *config.StaticConfigState, oauthState *oau
 				return
 			}
 
-			// Store the validated Authorization header in context for MCP handlers
-			// This is necessary because SSE transport doesn't propagate HTTP headers to MCP requests
-			ctx := context.WithValue(r.Context(), internalk8s.OAuthAuthorizationHeader, authHeader)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, r)
 		})
 	}
 }
