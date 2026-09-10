@@ -1,12 +1,16 @@
 package config_test
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/textlogger"
 
+	"github.com/containers/kubernetes-mcp-server/internal/test"
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 
@@ -59,6 +63,61 @@ func (s *ValidateSuite) TestListOutput() {
 		cfg := s.validConfig()
 		cfg.ListOutput = "table"
 		s.NoError(cfg.Validate(s.T().Context()))
+	})
+}
+
+// validateWithLogs runs Validate while capturing klog output.
+func (s *ValidateSuite) validateWithLogs(cfg *config.StaticConfig) string {
+	klogState := klog.CaptureState()
+	defer klogState.Restore()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	klog.InitFlags(flags)
+	var logBuffer test.SyncBuffer
+	klog.SetLogger(textlogger.NewLogger(textlogger.NewConfig(textlogger.Output(&logBuffer))))
+	s.Require().NoError(cfg.Validate(s.T().Context()))
+	return logBuffer.String()
+}
+
+func (s *ValidateSuite) TestTableOutputDisabledWarning() {
+	const warning = "fall back to yaml output"
+
+	s.Run("non-metadata path rule warns for the targeted kinds", func() {
+		cfg := s.validConfig()
+		cfg.ListOutput = "table"
+		cfg.MaskRules = []api.MaskRule{{Kinds: []string{"Service"}, Paths: []string{"spec.clusterIP"}}}
+		logs := s.validateWithLogs(cfg)
+		s.Contains(logs, warning)
+		s.Contains(logs, "Service")
+	})
+
+	s.Run("path rule without kinds warns for all kinds", func() {
+		cfg := s.validConfig()
+		cfg.ListOutput = "table"
+		cfg.MaskRules = []api.MaskRule{{Paths: []string{"spec.clusterIP"}}}
+		logs := s.validateWithLogs(cfg)
+		s.Contains(logs, warning)
+		s.Contains(logs, "all kinds")
+	})
+
+	s.Run("metadata-only path rule does not warn", func() {
+		cfg := s.validConfig()
+		cfg.ListOutput = "table"
+		cfg.MaskRules = []api.MaskRule{{Kinds: []string{"Service"}, Paths: []string{"metadata.annotations.secret"}}}
+		s.NotContains(s.validateWithLogs(cfg), warning)
+	})
+
+	s.Run("kind scoped regex rule does not warn", func() {
+		cfg := s.validConfig()
+		cfg.ListOutput = "table"
+		cfg.MaskRules = []api.MaskRule{{Kinds: []string{"Service"}, Regex: "[0-9]+"}}
+		s.NotContains(s.validateWithLogs(cfg), warning)
+	})
+
+	s.Run("yaml list_output does not warn", func() {
+		cfg := s.validConfig()
+		cfg.ListOutput = "yaml"
+		cfg.MaskRules = []api.MaskRule{{Kinds: []string{"Service"}, Paths: []string{"spec.clusterIP"}}}
+		s.NotContains(s.validateWithLogs(cfg), warning)
 	})
 }
 

@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/api/meta"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 )
@@ -35,7 +38,12 @@ type ResponseFilterRoundTripper struct {
 	maskValue     string
 	kindOnlyRules []compiledMaskRule // kinds only → mask entire resource
 	fieldRules    []compiledMaskRule // paths (+ optional kinds, + optional regex) → mask field values
-	regexRules    []compiledMaskRule // regex only → apply to entire serialized response
+	regexRules    []compiledMaskRule // regex without paths (+ optional kinds) → mask string values
+	// kindScoped is true when at least one rule is limited to specific kinds, in
+	// which case the kind has to be resolved from the request URL.
+	kindScoped         bool
+	restMapperProvider func() meta.RESTMapper
+	apiPathPrefix      string
 }
 
 // ResponseFilterConfig configures the ResponseFilterRoundTripper.
@@ -43,12 +51,17 @@ type ResponseFilterConfig struct {
 	Delegate  http.RoundTripper
 	MaskRules []api.MaskRule
 	MaskValue string
+	// RestMapperProvider resolves the request URL to a Kind for kind-scoped rules.
+	// Evaluated lazily because the mapper does not exist yet when the transport is wrapped.
+	RestMapperProvider func() meta.RESTMapper
+	// HostURL is the Kubernetes API server URL, used to strip a proxy path prefix.
+	HostURL string
 }
 
 // NewResponseFilterRoundTripper creates a new ResponseFilterRoundTripper.
 // Returns (nil, nil) if no rules are provided.
-// Returns an error if a rule has an invalid combination (Kinds + Regex without Paths)
-// or an invalid regex pattern.
+// Returns an error if a rule sets none of kinds, paths and regex, or has an
+// invalid regex pattern.
 func NewResponseFilterRoundTripper(cfg ResponseFilterConfig) (*ResponseFilterRoundTripper, error) {
 	if len(cfg.MaskRules) == 0 {
 		return nil, nil
@@ -59,16 +72,21 @@ func NewResponseFilterRoundTripper(cfg ResponseFilterConfig) (*ResponseFilterRou
 		maskValue = defaultMaskValue
 	}
 
+	var apiPathPrefix string
+	if cfg.HostURL != "" {
+		if hostURL, err := url.Parse(cfg.HostURL); err == nil {
+			apiPathPrefix = hostURL.Path
+		}
+	}
+
 	rt := &ResponseFilterRoundTripper{
-		delegate:  cfg.Delegate,
-		maskValue: maskValue,
+		delegate:           cfg.Delegate,
+		maskValue:          maskValue,
+		restMapperProvider: cfg.RestMapperProvider,
+		apiPathPrefix:      apiPathPrefix,
 	}
 
 	for i, rule := range cfg.MaskRules {
-		// Validate: Kinds + Regex without Paths is not supported
-		if len(rule.Kinds) > 0 && rule.Regex != "" && len(rule.Paths) == 0 {
-			return nil, fmt.Errorf("mask_rules[%d]: combining kinds with regex without paths is not supported (Kubernetes Table responses do not carry the resource kind)", i)
-		}
 		// Validate: at least one field must be set
 		if len(rule.Kinds) == 0 && len(rule.Paths) == 0 && rule.Regex == "" {
 			return nil, fmt.Errorf("mask_rules[%d]: at least one of kinds, paths, or regex must be set", i)
@@ -85,14 +103,18 @@ func NewResponseFilterRoundTripper(cfg ResponseFilterConfig) (*ResponseFilterRou
 			}
 			compiled.regex = re
 		}
+		if len(compiled.kinds) > 0 {
+			rt.kindScoped = true
+		}
 
-		if compiled.isKindOnly() {
+		switch {
+		case compiled.isKindOnly():
 			rt.kindOnlyRules = append(rt.kindOnlyRules, compiled)
-		} else if len(compiled.paths) > 0 {
+		case len(compiled.paths) > 0:
 			// Rules with paths go to fieldRules (handles kinds+paths, paths only, paths+regex)
 			rt.fieldRules = append(rt.fieldRules, compiled)
-		} else if compiled.regex != nil {
-			// Regex-only rules (no kinds, no paths)
+		default:
+			// Regex without paths, optionally scoped by kinds
 			rt.regexRules = append(rt.regexRules, compiled)
 		}
 	}
@@ -125,118 +147,179 @@ func (rt *ResponseFilterRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 		return resp, err
 	}
 
-	filtered := rt.filterResponseBody(body)
+	filtered := rt.filterResponseBody(body, rt.kindForRequest(req))
 
 	resp.Body = io.NopCloser(bytes.NewReader(filtered))
 	resp.ContentLength = int64(len(filtered))
 	return resp, nil
 }
 
+// kindForRequest resolves the resource Kind addressed by the request URL.
+// Returns "" when the request is not a resource request or the kind cannot be
+// resolved. Table responses carry no usable kind, so this is the only way to
+// scope rules for them.
+func (rt *ResponseFilterRoundTripper) kindForRequest(req *http.Request) string {
+	if !rt.kindScoped || rt.restMapperProvider == nil {
+		return ""
+	}
+	// Discovery endpoints are not resource requests, which also keeps the
+	// RESTMapper lookup below from recursing through this round tripper.
+	gvr, ok := parseURLToGVR(stripAPIPathPrefix(req.URL.Path, rt.apiPathPrefix))
+	if !ok {
+		return ""
+	}
+	restMapper := rt.restMapperProvider()
+	if restMapper == nil {
+		return ""
+	}
+	gvk, err := restMapper.KindFor(gvr)
+	if err != nil {
+		return ""
+	}
+	return gvk.Kind
+}
+
 // filterResponseBody applies kind-only rules, field rules, then regex rules.
-func (rt *ResponseFilterRoundTripper) filterResponseBody(body []byte) []byte {
+// requestKind is the Kind resolved from the request URL, used wherever the
+// response payload itself does not carry a usable kind.
+func (rt *ResponseFilterRoundTripper) filterResponseBody(body []byte, requestKind string) []byte {
 	var obj map[string]any
-	parsed := json.Unmarshal(body, &obj) == nil
-
-	if parsed {
-		modified := false
-
-		// Apply kind-only rules (mask entire resources)
-		if len(rt.kindOnlyRules) > 0 {
-			modified = rt.applyKindOnlyRules(obj) || modified
-		}
-
-		// Apply field-based rules (kinds+paths, paths only, paths+regex)
-		if len(rt.fieldRules) > 0 {
-			rt.applyFieldRules(obj)
-			modified = true
-		}
-
-		if modified {
-			if result, err := json.Marshal(obj); err == nil {
-				body = result
-			}
-		}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		// Not a JSON object: fall back to a raw replacement, which can only
+		// honor rules that are neither kind- nor path-scoped.
+		return rt.applyRegexRulesRaw(body)
 	}
 
-	// Apply regex-only rules against entire serialized JSON
+	scopes := documentScopes(obj, requestKind)
+	modified := false
+
+	// Apply kind-only rules (mask entire resources)
+	if len(rt.kindOnlyRules) > 0 {
+		modified = rt.applyKindOnlyRules(scopes) || modified
+	}
+
+	// Apply field-based rules (kinds+paths, paths only, paths+regex)
+	if len(rt.fieldRules) > 0 {
+		modified = rt.applyFieldRules(scopes) || modified
+	}
+
+	// Apply regex rules without paths (kinds+regex, regex only)
 	if len(rt.regexRules) > 0 {
-		body = rt.applyRegexRules(body)
+		modified = rt.applyRegexRules(scopes) || modified
 	}
 
+	if modified {
+		if result, err := json.Marshal(obj); err == nil {
+			return result
+		}
+	}
 	return body
 }
 
-// applyKindOnlyRules masks entire resources when only kinds are specified.
-// Returns true if any modification was made.
-func (rt *ResponseFilterRoundTripper) applyKindOnlyRules(obj map[string]any) bool {
+// documentScope is one masking unit of a response document: the kind its values
+// have to be matched against, the resource objects it contains, and, for Table
+// responses, the printed row cells.
+type documentScope struct {
+	kind string
+	// kindUnresolved marks a resource payload whose kind could not be determined,
+	// e.g. a Table whose request URL maps to no known resource. Kind-scoped rules
+	// still apply to it so that masking fails closed.
+	kindUnresolved bool
+	objects        []map[string]any
+	cells          []any
+}
+
+// matchesKinds reports whether a rule scoped to ruleKinds applies to this scope.
+func (s documentScope) matchesKinds(ruleKinds []string) bool {
+	return s.kindUnresolved || matchesKinds(ruleKinds, s.kind)
+}
+
+// documentScopes splits a response document into maskable scopes, handling
+// single resources, typed lists (e.g. SecretList), generic Lists, and Tables.
+func documentScopes(obj map[string]any, requestKind string) []documentScope {
 	kind, _ := obj["kind"].(string)
 
-	if strings.HasSuffix(kind, "List") || kind == "List" {
-		return rt.applyKindOnlyToList(obj, strings.TrimSuffix(kind, "List"))
-	}
 	if kind == "Table" {
-		return rt.applyKindOnlyToTable(obj)
+		rows, _ := obj["rows"].([]any)
+		scopes := make([]documentScope, 0, len(rows))
+		for _, row := range rows {
+			rowObj, ok := row.(map[string]any)
+			if !ok {
+				continue
+			}
+			rowObject, _ := rowObj["object"].(map[string]any)
+			rowKind, _ := rowObject["kind"].(string)
+			scope := documentScope{}
+			scope.kind, scope.kindUnresolved = effectiveKind(rowKind, requestKind, true)
+			if rowObject != nil {
+				scope.objects = append(scope.objects, rowObject)
+			}
+			// The values the model actually sees are the printed cells, not the
+			// row object (which is a PartialObjectMetadata by default).
+			if cells, ok := rowObj["cells"].([]any); ok {
+				scope.cells = append(scope.cells, cells)
+			}
+			scopes = append(scopes, scope)
+		}
+		return scopes
 	}
 
-	for _, rule := range rt.kindOnlyRules {
-		if matchesKinds(rule.kinds, kind) {
-			rt.maskEntireResource(obj)
-			return true
+	if strings.HasSuffix(kind, "List") {
+		items, _ := obj["items"].([]any)
+		itemKind := strings.TrimSuffix(kind, "List")
+		scopes := make([]documentScope, 0, len(items))
+		for _, item := range items {
+			itemObj, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			k, _ := itemObj["kind"].(string)
+			if k == "" {
+				k = itemKind
+			}
+			scope := documentScope{objects: []map[string]any{itemObj}}
+			scope.kind, scope.kindUnresolved = effectiveKind(k, requestKind, true)
+			scopes = append(scopes, scope)
 		}
+		return scopes
 	}
-	return false
+
+	scope := documentScope{objects: []map[string]any{obj}}
+	scope.kind, scope.kindUnresolved = effectiveKind(kind, requestKind, kind != "")
+	return []documentScope{scope}
 }
 
-// applyKindOnlyToList masks entire items in a list when they match kind-only rules.
-func (rt *ResponseFilterRoundTripper) applyKindOnlyToList(obj map[string]any, itemKind string) bool {
-	items, ok := obj["items"].([]any)
-	if !ok {
-		return false
+// effectiveKind resolves the kind a scope has to be matched against, falling
+// back to the kind resolved from the request URL whenever the payload kind does
+// not identify the underlying resource. The second return value reports that the
+// kind stayed unknown, which makes kind-scoped rules apply anyway.
+// isResource tells apart a resource whose kind is merely unknown from a payload
+// that is no resource at all (e.g. /version), which kind-scoped rules never match.
+func effectiveKind(payloadKind, requestKind string, isResource bool) (string, bool) {
+	switch payloadKind {
+	case "", "Table", "List", "PartialObjectMetadata", "PartialObjectMetadataList":
+		if requestKind != "" {
+			return requestKind, false
+		}
+		return payloadKind, isResource
 	}
-	modified := false
-	for _, item := range items {
-		itemObj, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		k, _ := itemObj["kind"].(string)
-		if k == "" {
-			k = itemKind
-		}
-		for _, rule := range rt.kindOnlyRules {
-			if matchesKinds(rule.kinds, k) {
-				rt.maskEntireResource(itemObj)
-				modified = true
-				break
-			}
-		}
-	}
-	return modified
+	return payloadKind, false
 }
 
-// applyKindOnlyToTable masks entire Table row objects when they match kind-only rules.
-func (rt *ResponseFilterRoundTripper) applyKindOnlyToTable(obj map[string]any) bool {
-	rows, ok := obj["rows"].([]any)
-	if !ok {
-		return false
-	}
+// applyKindOnlyRules masks entire resources when only kinds are specified.
+// Table cells are left untouched so masked rows remain identifiable.
+func (rt *ResponseFilterRoundTripper) applyKindOnlyRules(scopes []documentScope) bool {
 	modified := false
-	for _, row := range rows {
-		rowObj, ok := row.(map[string]any)
-		if !ok {
-			continue
-		}
-		rowObject, ok := rowObj["object"].(map[string]any)
-		if !ok {
-			continue
-		}
-		k, _ := rowObject["kind"].(string)
+	for _, scope := range scopes {
 		for _, rule := range rt.kindOnlyRules {
-			if matchesKinds(rule.kinds, k) {
-				rt.maskEntireResource(rowObject)
-				modified = true
-				break
+			if !scope.matchesKinds(rule.kinds) {
+				continue
 			}
+			for _, obj := range scope.objects {
+				rt.maskEntireResource(obj)
+				modified = true
+			}
+			break
 		}
 	}
 	return modified
@@ -255,103 +338,90 @@ func (rt *ResponseFilterRoundTripper) maskEntireResource(obj map[string]any) {
 	}
 }
 
-// applyFieldRules applies field masking to a parsed JSON object.
-// Handles rules with paths (optionally scoped by kinds, optionally with regex).
-// Handles single resources, typed lists (e.g. SecretList), generic Lists, and Tables.
-func (rt *ResponseFilterRoundTripper) applyFieldRules(obj map[string]any) {
-	kind, _ := obj["kind"].(string)
-
-	// Check if this is a list type
-	if strings.HasSuffix(kind, "List") || kind == "List" {
-		rt.applyFieldRulesToList(obj, strings.TrimSuffix(kind, "List"))
-		return
-	}
-	if kind == "Table" {
-		rt.applyFieldRulesToTable(obj)
-		return
-	}
-
-	// Single resource
-	for _, rule := range rt.fieldRules {
-		if matchesKinds(rule.kinds, kind) {
-			for _, path := range rule.paths {
-				if rule.regex != nil {
-					rt.maskPathWithRegex(obj, path, rule.regex)
-				} else {
-					rt.maskPath(obj, path)
-				}
-			}
-		}
-	}
-}
-
-// applyFieldRulesToList applies field rules to items in a list response.
-func (rt *ResponseFilterRoundTripper) applyFieldRulesToList(obj map[string]any, itemKind string) {
-	items, ok := obj["items"].([]any)
-	if !ok {
-		return
-	}
-	for _, item := range items {
-		itemObj, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		// Determine the kind of the item — prefer item's own kind, fall back to list-derived kind
-		k, _ := itemObj["kind"].(string)
-		if k == "" {
-			k = itemKind
-		}
+// applyFieldRules masks the configured paths, optionally scoped by kinds and
+// optionally limited to regex matches within the field values.
+// Paths only address resource objects; Table cells have no addressable paths.
+func (rt *ResponseFilterRoundTripper) applyFieldRules(scopes []documentScope) bool {
+	modified := false
+	for _, scope := range scopes {
 		for _, rule := range rt.fieldRules {
-			if matchesKinds(rule.kinds, k) {
+			if !scope.matchesKinds(rule.kinds) {
+				continue
+			}
+			for _, obj := range scope.objects {
 				for _, path := range rule.paths {
 					if rule.regex != nil {
-						rt.maskPathWithRegex(itemObj, path, rule.regex)
+						rt.maskPathWithRegex(obj, path, rule.regex)
 					} else {
-						rt.maskPath(itemObj, path)
+						rt.maskPath(obj, path)
 					}
+					modified = true
 				}
 			}
 		}
 	}
+	return modified
 }
 
-// applyFieldRulesToTable applies field rules to Table rows (rows[].object).
-func (rt *ResponseFilterRoundTripper) applyFieldRulesToTable(obj map[string]any) {
-	rows, ok := obj["rows"].([]any)
-	if !ok {
-		return
-	}
-	for _, row := range rows {
-		rowObj, ok := row.(map[string]any)
-		if !ok {
-			continue
-		}
-		rowObject, ok := rowObj["object"].(map[string]any)
-		if !ok {
-			continue
-		}
-		k, _ := rowObject["kind"].(string)
-		for _, rule := range rt.fieldRules {
-			if matchesKinds(rule.kinds, k) {
-				for _, path := range rule.paths {
-					if rule.regex != nil {
-						rt.maskPathWithRegex(rowObject, path, rule.regex)
-					} else {
-						rt.maskPath(rowObject, path)
-					}
-				}
+// applyRegexRules applies regex rules that have no paths to every string value
+// of the matching scopes, including Table cells.
+func (rt *ResponseFilterRoundTripper) applyRegexRules(scopes []documentScope) bool {
+	modified := false
+	for _, scope := range scopes {
+		for _, rule := range rt.regexRules {
+			if !scope.matchesKinds(rule.kinds) {
+				continue
+			}
+			for _, obj := range scope.objects {
+				modified = rt.maskStringValues(obj, rule.regex) || modified
+			}
+			for _, cells := range scope.cells {
+				modified = rt.maskStringValues(cells, rule.regex) || modified
 			}
 		}
 	}
+	return modified
 }
 
-// applyRegexRules applies regex-only rules to the entire serialized response.
-// These rules have no kind scoping (rejected at validation time).
-func (rt *ResponseFilterRoundTripper) applyRegexRules(body []byte) []byte {
+// applyRegexRulesRaw is the fallback for responses that are not a JSON object.
+// Kind-scoped rules are applied too: there is no kind to match against, and
+// masking fails closed.
+func (rt *ResponseFilterRoundTripper) applyRegexRulesRaw(body []byte) []byte {
 	for _, rule := range rt.regexRules {
 		body = rule.regex.ReplaceAll(body, []byte(rt.maskValue))
 	}
 	return body
+}
+
+// maskStringValues replaces regex matches in every string value reachable from v.
+// Map keys are never rewritten, so the JSON structure always stays intact.
+func (rt *ResponseFilterRoundTripper) maskStringValues(v any, regex *regexp.Regexp) bool {
+	modified := false
+	switch t := v.(type) {
+	case map[string]any:
+		for key, val := range t {
+			if s, ok := val.(string); ok {
+				if masked := regex.ReplaceAllString(s, rt.maskValue); masked != s {
+					t[key] = masked
+					modified = true
+				}
+				continue
+			}
+			modified = rt.maskStringValues(val, regex) || modified
+		}
+	case []any:
+		for i, val := range t {
+			if s, ok := val.(string); ok {
+				if masked := regex.ReplaceAllString(s, rt.maskValue); masked != s {
+					t[i] = masked
+					modified = true
+				}
+				continue
+			}
+			modified = rt.maskStringValues(val, regex) || modified
+		}
+	}
+	return modified
 }
 
 // matchesKinds returns true if the resource kind matches any of the rule's kinds.

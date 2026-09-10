@@ -261,8 +261,9 @@ func initPods() []api.ServerTool {
 
 func podsListInAllNamespaces(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	p := api.WrapParams(params)
+	listOutput := params.ListOutputForKind("Pod")
 	resourceListOptions := api.ListOptions{
-		AsTable: params.ListOutput.AsTable(),
+		AsTable: listOutput.AsTable(),
 	}
 	resourceListOptions.LabelSelector = p.OptionalString("labelSelector", "")
 	resourceListOptions.FieldSelector = p.OptionalString("fieldSelector", "")
@@ -273,14 +274,15 @@ func podsListInAllNamespaces(params api.ToolHandlerParams) (*api.ToolCallResult,
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list pods in all namespaces: %w", err)), nil
 	}
-	return api.NewToolCallResult(params.ListOutput.PrintObj(ret)), nil
+	return api.NewToolCallResult(listOutput.PrintObj(ret)), nil
 }
 
 func podsListInNamespace(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	p := api.WrapParams(params)
 	ns := p.RequiredString("namespace")
+	listOutput := params.ListOutputForKind("Pod")
 	resourceListOptions := api.ListOptions{
-		AsTable: params.ListOutput.AsTable(),
+		AsTable: listOutput.AsTable(),
 	}
 	resourceListOptions.LabelSelector = p.OptionalString("labelSelector", "")
 	resourceListOptions.FieldSelector = p.OptionalString("fieldSelector", "")
@@ -291,7 +293,7 @@ func podsListInNamespace(params api.ToolHandlerParams) (*api.ToolCallResult, err
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list pods in namespace %s: %w", ns, err)), nil
 	}
-	return api.NewToolCallResult(params.ListOutput.PrintObj(ret)), nil
+	return api.NewToolCallResult(listOutput.PrintObj(ret)), nil
 }
 
 func podsGet(params api.ToolHandlerParams) (*api.ToolCallResult, error) {

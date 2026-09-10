@@ -562,6 +562,7 @@ func (c *StaticConfig) Validate(ctx context.Context) error {
 	if output.FromString(c.ListOutput) == nil {
 		return fmt.Errorf("invalid output name: %s, valid names are: %s", c.ListOutput, strings.Join(output.Names, ", "))
 	}
+	c.warnTableOutputDisabled(ctx)
 	if err := toolsets.Validate(c.Toolsets); err != nil {
 		return err
 	}
@@ -629,6 +630,29 @@ func (c *StaticConfig) Validate(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// warnTableOutputDisabled warns when mask rules force list operations off the more
+// compact table output. Table rows only embed a PartialObjectMetadata, so a rule
+// with a path outside of "metadata" cannot be applied to them.
+func (c *StaticConfig) warnTableOutputDisabled(ctx context.Context) {
+	if c.ListOutput != "table" {
+		return
+	}
+	kinds, allKinds := api.TableIncompatibleKinds(c.MaskRules)
+	if !allKinds && len(kinds) == 0 {
+		return
+	}
+	scope := strings.Join(kinds, ", ")
+	if allKinds {
+		scope = "all kinds"
+	}
+	klogutil.LogWarn(
+		klogutil.FromContext(ctx),
+		"mask_rules target field paths that Kubernetes Table responses do not carry: list operations for these kinds fall back to yaml output, which may increase token usage",
+		klogutil.Field("config.list_output", c.ListOutput),
+		klogutil.Field("mask_rules.table_incompatible_kinds", scope),
+	)
 }
 
 // validateConfirmation validates confirmation-related fields:

@@ -713,7 +713,7 @@ Each rule is defined as a `[[mask_rules]]` entry with three optional fields:
 |-------|------|-------------|
 | `kinds` | string array | Kubernetes resource kinds to scope the rule to (e.g. `["Secret"]`). If empty, the rule applies to all kinds. |
 | `paths` | string array | Dot-separated field paths whose values are replaced with `[MASK]`. Supports map wildcards (`data.*` masks all values under `data`). |
-| `regex` | string | Regular expression pattern. All matches in the serialized JSON response are replaced with `[MASK]`. Applied after field-based masking. |
+| `regex` | string | Regular expression pattern. All matches inside string values of the response (including table cells) are replaced with `[MASK]`. Field names are never rewritten. Applied after field-based masking. |
 
 At least one of `kinds`, `paths`, or `regex` must be set. The fields combine as follows:
 
@@ -750,6 +750,31 @@ regex = '(?i)(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:|(?:[
 [[mask_rules]]
 paths = ["metadata.annotations.kubectl.kubernetes.io/last-applied-configuration"]
 ```
+
+#### Masking and `list_output = "table"`
+
+With `list_output = "table"`, list tools ask the Kubernetes API for a `Table`
+response. A `Table` is a generic envelope: the printed values live in
+`rows[].cells` and each row only carries the resource's `apiVersion`, `kind` and
+`metadata` — not its `spec` or `status`.
+
+This has two consequences:
+
+- **The kind is resolved from the request URL**, not from the response payload,
+  so `kinds`-scoped rules work exactly the same for table and yaml output. Regex
+  rules are applied to the row cells as well, which is where values such as
+  `CLUSTER-IP` or `EXTERNAL-IP` actually appear. If the kind cannot be resolved,
+  masking fails closed: kind-scoped rules are applied to the response anyway.
+- **Rules with `paths` outside `metadata` cannot be enforced on a table.** For
+  those kinds, list tools automatically fall back to `yaml` output so the rule is
+  still applied. A warning is logged at startup (and on configuration reload)
+  naming the affected kinds, since yaml output increases token usage. Other kinds
+  keep using table output.
+
+For example, `paths = ["spec.clusterIP"]` with `kinds = ["Service"]` makes
+`resources_list` return yaml for Services while still returning tables for every
+other kind. Expressing the same intent as a regex rule
+(`kinds = ["Service"]` + an IP pattern) keeps table output enabled.
 
 ### Toolset-Specific Configuration
 

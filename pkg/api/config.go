@@ -1,5 +1,11 @@
 package api
 
+import (
+	"slices"
+	"sort"
+	"strings"
+)
+
 const (
 	ClusterProviderKubeConfig = "kubeconfig"
 	ClusterProviderInCluster  = "in-cluster"
@@ -114,17 +120,18 @@ type RequireOAuthProvider interface {
 //
 //   - Kinds only: the entire resource is masked (all non-identity fields replaced) for matching kinds.
 //   - Kinds + Paths: only the specified field paths are masked within matching kinds.
+//   - Kinds + Regex: the regex is applied to every string value of matching kinds.
 //   - Paths only: the specified field paths are masked regardless of kind.
-//   - Regex only: the regex is applied to all responses regardless of kind.
-//   - Paths + Regex: the regex is applied only to the values at the specified field paths, regardless of kind.
+//   - Regex only: the regex is applied to every string value regardless of kind.
+//   - Paths + Regex: the regex is applied only to the values at the specified field paths.
 //
-// The combination Kinds + Regex (without Paths) is NOT supported because Kubernetes may
-// return data as kind "Table" without the actual resource kind, preventing reliable
-// kind-scoped regex filtering.
+// Kubernetes Table responses (list_output = "table") carry no resource kind, so the kind is
+// resolved from the request URL instead. Table rows only embed a PartialObjectMetadata, which
+// means Paths outside of metadata cannot be masked in a Table; list operations for the affected
+// kinds therefore fall back to YAML output. See TableIncompatibleKinds.
 type MaskRule struct {
 	// Kinds lists the Kubernetes resource kinds this rule applies to (e.g., ["Secret"], ["Pod", "Deployment"]).
 	// If empty, the rule applies to all resource kinds.
-	// Cannot be combined with Regex unless Paths is also set.
 	Kinds []string `json:"kinds,omitempty" toml:"kinds,omitempty"`
 	// Paths lists dot-separated field paths whose values should be masked.
 	// When Regex is not set, matched values are replaced with the configured mask value.
@@ -133,10 +140,55 @@ type MaskRule struct {
 	// Examples: "data.*", "stringData.*", "spec.containers.env.value"
 	Paths []string `json:"paths,omitempty" toml:"paths,omitempty"`
 	// Regex is a regular expression pattern. All matches are replaced with the configured mask value.
-	// Without Paths: applied to the entire serialized JSON response.
+	// Without Paths: applied to every string value of the response, including Table row cells.
 	// With Paths: applied only to the string values at the matched field paths.
-	// Cannot be combined with Kinds unless Paths is also set.
 	Regex string `json:"regex,omitempty" toml:"regex,omitempty"`
+}
+
+// TableIncompatibleKinds reports the kinds whose list operations cannot be served as a
+// Kubernetes Table without leaking data the rules are meant to mask. Table rows only embed a
+// PartialObjectMetadata, so a rule with a path outside of "metadata" has nothing to match
+// against. Returns allKinds=true when such a rule is not scoped to specific kinds.
+func TableIncompatibleKinds(rules []MaskRule) (kinds []string, allKinds bool) {
+	seen := make(map[string]bool)
+	for _, rule := range rules {
+		tableSafe := true
+		for _, path := range rule.Paths {
+			if head, _, _ := strings.Cut(path, "."); head != "metadata" {
+				tableSafe = false
+				break
+			}
+		}
+		if tableSafe {
+			continue
+		}
+		if len(rule.Kinds) == 0 {
+			allKinds = true
+			continue
+		}
+		for _, kind := range rule.Kinds {
+			if kind == "*" {
+				allKinds = true
+				continue
+			}
+			if !seen[kind] {
+				seen[kind] = true
+				kinds = append(kinds, kind)
+			}
+		}
+	}
+	sort.Strings(kinds)
+	return kinds, allKinds
+}
+
+// IsTableOutputAllowed reports whether list operations for the given kind may be served as a
+// Kubernetes Table under the configured mask rules.
+func IsTableOutputAllowed(rules []MaskRule, kind string) bool {
+	incompatible, allKinds := TableIncompatibleKinds(rules)
+	if allKinds {
+		return false
+	}
+	return !slices.Contains(incompatible, kind)
 }
 
 // ResponseFilterProvider provides access to response filtering settings.

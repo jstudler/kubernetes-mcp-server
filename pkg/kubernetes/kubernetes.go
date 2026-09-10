@@ -90,9 +90,11 @@ func NewKubernetes(
 	if rules := baseConfig.GetMaskRules(); len(rules) > 0 {
 		k.restConfig.Wrap(func(original http.RoundTripper) http.RoundTripper {
 			rt, err := NewResponseFilterRoundTripper(ResponseFilterConfig{
-				Delegate:  original,
-				MaskRules: rules,
-				MaskValue: baseConfig.GetMaskValue(),
+				Delegate:           original,
+				MaskRules:          rules,
+				MaskValue:          baseConfig.GetMaskValue(),
+				RestMapperProvider: func() meta.RESTMapper { return k.restMapper },
+				HostURL:            k.restConfig.Host,
 			})
 			if err != nil {
 				// Programming error: config validation should catch invalid regexes.

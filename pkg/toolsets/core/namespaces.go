@@ -64,7 +64,8 @@ func initNamespaces(p api.FilteringProvider) []api.ServerTool {
 
 func namespacesList(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	p := api.WrapParams(params)
-	options := api.ListOptions{AsTable: params.ListOutput.AsTable()}
+	listOutput := params.ListOutputForKind("Namespace")
+	options := api.ListOptions{AsTable: listOutput.AsTable()}
 	options.FieldSelector = p.OptionalString("fieldSelector", "")
 	if err := p.Err(); err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list namespaces: %w", err)), nil
@@ -73,13 +74,14 @@ func namespacesList(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list namespaces: %w", err)), nil
 	}
-	return api.NewToolCallResult(params.ListOutput.PrintObj(ret)), nil
+	return api.NewToolCallResult(listOutput.PrintObj(ret)), nil
 }
 
 func projectsList(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
-	ret, err := kubernetes.NewCore(params).ProjectsList(params, api.ListOptions{AsTable: params.ListOutput.AsTable()})
+	listOutput := params.ListOutputForKind("Project")
+	ret, err := kubernetes.NewCore(params).ProjectsList(params, api.ListOptions{AsTable: listOutput.AsTable()})
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list projects: %w", err)), nil
 	}
-	return api.NewToolCallResult(params.ListOutput.PrintObj(ret)), nil
+	return api.NewToolCallResult(listOutput.PrintObj(ret)), nil
 }

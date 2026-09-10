@@ -3,6 +3,8 @@ _output/
 .vscode/
 .docusaurus/
 node_modules/
+.DS_Store
+__debug_bin*
 
 .npmrc
 kubernetes-mcp-server

@@ -7,8 +7,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/stretchr/testify/suite"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
 )
 
 type ResponseFilterRoundTripperSuite struct {
@@ -52,6 +55,23 @@ func (s *ResponseFilterRoundTripperSuite) mustNewRTWithMaskValue(delegate http.R
 	return rt
 }
 
+// mustNewRTWithRestMapper builds a round tripper that can resolve the request URL to a
+// Kind, which is the only way to scope rules for Table responses.
+func (s *ResponseFilterRoundTripperSuite) mustNewRTWithRestMapper(delegate http.RoundTripper, rules []api.MaskRule, gvks ...schema.GroupVersionKind) *ResponseFilterRoundTripper {
+	restMapper := meta.NewDefaultRESTMapper(nil)
+	for _, gvk := range gvks {
+		restMapper.Add(gvk, meta.RESTScopeNamespace)
+	}
+	rt, err := NewResponseFilterRoundTripper(ResponseFilterConfig{
+		Delegate:           delegate,
+		MaskRules:          rules,
+		RestMapperProvider: func() meta.RESTMapper { return restMapper },
+	})
+	s.Require().NoError(err)
+	s.Require().NotNil(rt)
+	return rt
+}
+
 func (s *ResponseFilterRoundTripperSuite) TestNewResponseFilterRoundTripperReturnsNilWhenNoRules() {
 	rt, err := NewResponseFilterRoundTripper(ResponseFilterConfig{
 		Delegate:  nil,
@@ -72,16 +92,15 @@ func (s *ResponseFilterRoundTripperSuite) TestNewResponseFilterRoundTripperRejec
 	s.Contains(err.Error(), "mask_rules[0]")
 }
 
-func (s *ResponseFilterRoundTripperSuite) TestNewResponseFilterRoundTripperRejectsKindsWithRegexWithoutPaths() {
-	_, err := NewResponseFilterRoundTripper(ResponseFilterConfig{
+func (s *ResponseFilterRoundTripperSuite) TestNewResponseFilterRoundTripperAcceptsKindsWithRegexWithoutPaths() {
+	rt, err := NewResponseFilterRoundTripper(ResponseFilterConfig{
 		Delegate: nil,
 		MaskRules: []api.MaskRule{
 			{Kinds: []string{"Service"}, Regex: `\d+`},
 		},
 	})
-	s.Error(err)
-	s.Contains(err.Error(), "mask_rules[0]")
-	s.Contains(err.Error(), "combining kinds with regex without paths is not supported")
+	s.NoError(err)
+	s.NotNil(rt)
 }
 
 func (s *ResponseFilterRoundTripperSuite) TestNewResponseFilterRoundTripperRejectsEmptyRule() {
@@ -363,6 +382,176 @@ func (s *ResponseFilterRoundTripperSuite) TestRegexRules() {
 		bodyStr := string(body)
 		s.Contains(bodyStr, "8080")
 		s.Contains(bodyStr, "1.2.3")
+	})
+
+	s.Run("does not mask map keys", func() {
+		cm := `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"my-cm"},"data":{"10.0.0.1":"upstream"}}`
+		rt := s.mustNewRT(s.newMockDelegate(cm), []api.MaskRule{ipv4Rule})
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/configmaps/my-cm", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]any
+		s.Require().NoError(json.Unmarshal(body, &result))
+		data := result["data"].(map[string]any)
+		s.Contains(data, "10.0.0.1")
+	})
+}
+
+// serviceTable mimics a `list_output = "table"` response: rows carry a
+// PartialObjectMetadata, and the printed values live in the cells.
+const serviceTable = `{
+	"kind":"Table",
+	"apiVersion":"meta.k8s.io/v1",
+	"columnDefinitions":[{"name":"Name","type":"string"},{"name":"Cluster-IP","type":"string"},{"name":"External-IP","type":"string"}],
+	"rows":[
+		{
+			"cells":["my-svc","10.96.0.42","203.0.113.50"],
+			"object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"name":"my-svc","namespace":"default"}}
+		}
+	]
+}`
+
+func (s *ResponseFilterRoundTripperSuite) TestKindScopedRegexRules() {
+	ipv4Rule := api.MaskRule{
+		Kinds: []string{"Service"},
+		Regex: `\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?:/[0-9]{1,2})?\b`,
+	}
+	serviceGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"}
+	podGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}
+
+	s.Run("masks matching kind in a yaml (non-table) response", func() {
+		svc := `{"apiVersion":"v1","kind":"Service","metadata":{"name":"my-svc"},"spec":{"clusterIP":"10.96.0.42"},"status":{"loadBalancer":{"ingress":[{"ip":"203.0.113.50"}]}}}`
+		rt := s.mustNewRTWithRestMapper(s.newMockDelegate(svc), []api.MaskRule{ipv4Rule}, serviceGVK)
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services/my-svc", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		s.NotContains(bodyStr, "10.96.0.42")
+		s.NotContains(bodyStr, "203.0.113.50")
+		s.Contains(bodyStr, "[MASK]")
+	})
+
+	s.Run("does not mask a non-matching kind", func() {
+		pod := `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"my-pod"},"status":{"podIP":"10.244.0.5"}}`
+		rt := s.mustNewRTWithRestMapper(s.newMockDelegate(pod), []api.MaskRule{ipv4Rule}, podGVK)
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/pods/my-pod", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		s.Contains(string(body), "10.244.0.5")
+	})
+
+	s.Run("masks Table cells using the kind resolved from the request", func() {
+		rt := s.mustNewRTWithRestMapper(s.newMockDelegate(serviceTable), []api.MaskRule{ipv4Rule}, serviceGVK)
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]any
+		s.Require().NoError(json.Unmarshal(body, &result))
+
+		cells := result["rows"].([]any)[0].(map[string]any)["cells"].([]any)
+		s.Equal("my-svc", cells[0], "non-matching cells are preserved")
+		s.Equal("[MASK]", cells[1])
+		s.Equal("[MASK]", cells[2])
+	})
+
+	s.Run("does not mask Table cells of a non-matching kind", func() {
+		rt := s.mustNewRTWithRestMapper(s.newMockDelegate(serviceTable), []api.MaskRule{
+			{Kinds: []string{"Pod"}, Regex: ipv4Rule.Regex},
+		}, serviceGVK)
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		s.Contains(string(body), "10.96.0.42")
+	})
+
+	s.Run("applies kind-scoped rules when the kind cannot be resolved", func() {
+		rt := s.mustNewRT(s.newMockDelegate(serviceTable), []api.MaskRule{ipv4Rule})
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		s.NotContains(string(body), "10.96.0.42", "masking has to fail closed")
+	})
+
+	s.Run("does not apply kind-scoped rules to payloads that are not resources", func() {
+		version := `{"major":"1","minor":"31","gitVersion":"v1.31.0","buildDate":"10.96.0.42"}`
+		rt := s.mustNewRT(s.newMockDelegate(version), []api.MaskRule{ipv4Rule})
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/version", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		s.Contains(string(body), "10.96.0.42")
+	})
+
+	s.Run("kind-less regex rules mask Table cells without a rest mapper", func() {
+		rt := s.mustNewRT(s.newMockDelegate(serviceTable), []api.MaskRule{{Regex: ipv4Rule.Regex}})
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]any
+		s.Require().NoError(json.Unmarshal(body, &result))
+
+		cells := result["rows"].([]any)[0].(map[string]any)["cells"].([]any)
+		s.Equal("my-svc", cells[0])
+		s.Equal("[MASK]", cells[1])
+		s.Equal("[MASK]", cells[2])
+	})
+
+	s.Run("masks list items using the kind resolved from the request", func() {
+		list := `{"apiVersion":"v1","kind":"List","items":[{"metadata":{"name":"my-svc"},"spec":{"clusterIP":"10.96.0.42"}}]}`
+		rt := s.mustNewRTWithRestMapper(s.newMockDelegate(list), []api.MaskRule{ipv4Rule}, serviceGVK)
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		s.NotContains(string(body), "10.96.0.42")
+	})
+}
+
+func (s *ResponseFilterRoundTripperSuite) TestKindScopedPathRulesOnTable() {
+	serviceGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"}
+
+	s.Run("masks metadata paths in Table rows using the request kind", func() {
+		table := `{"kind":"Table","rows":[{"cells":["my-svc"],"object":{"kind":"PartialObjectMetadata","metadata":{"name":"my-svc","annotations":{"secret":"hide-me"}}}}]}`
+		rt := s.mustNewRTWithRestMapper(s.newMockDelegate(table), []api.MaskRule{
+			{Kinds: []string{"Service"}, Paths: []string{"metadata.annotations.secret"}},
+		}, serviceGVK)
+
+		req := httptest.NewRequest(http.MethodGet, "http://localhost/api/v1/namespaces/default/services", nil)
+		resp, err := rt.RoundTrip(req)
+		s.Require().NoError(err)
+
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]any
+		s.Require().NoError(json.Unmarshal(body, &result))
+
+		rowObject := result["rows"].([]any)[0].(map[string]any)["object"].(map[string]any)
+		annotations := rowObject["metadata"].(map[string]any)["annotations"].(map[string]any)
+		s.Equal("[MASK]", annotations["secret"])
 	})
 }
 

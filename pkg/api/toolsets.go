@@ -172,6 +172,19 @@ type ToolHandlerParams struct {
 	Elicitor
 }
 
+// ListOutputForKind returns the output format to use when listing the given kind.
+// Table output falls back to YAML when a mask rule targets a field path that a
+// Kubernetes Table row does not carry, since the value could not be masked there.
+func (p ToolHandlerParams) ListOutputForKind(kind string) output.Output {
+	if p.ListOutput == nil || !p.ListOutput.AsTable() {
+		return p.ListOutput
+	}
+	if IsTableOutputAllowed(p.GetMaskRules(), kind) {
+		return p.ListOutput
+	}
+	return output.Yaml
+}
+
 type ToolHandlerFunc func(params ToolHandlerParams) (*ToolCallResult, error)
 
 // ErrElicitationNotSupported is returned when the MCP client does not support elicitation.

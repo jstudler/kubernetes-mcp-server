@@ -203,9 +203,14 @@ func resourcesList(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	if namespace == nil {
 		namespace = ""
 	}
+	gvk, err := parseGroupVersionKind(params.GetArguments())
+	if err != nil {
+		return api.NewToolCallResult("", fmt.Errorf("failed to list resources, %s", err)), nil
+	}
+	listOutput := params.ListOutputForKind(gvk.Kind)
 	labelSelector := params.GetArguments()["labelSelector"]
 	resourceListOptions := api.ListOptions{
-		AsTable: params.ListOutput.AsTable(),
+		AsTable: listOutput.AsTable(),
 	}
 
 	if labelSelector != nil {
@@ -223,10 +228,6 @@ func resourcesList(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		}
 		resourceListOptions.FieldSelector = f
 	}
-	gvk, err := parseGroupVersionKind(params.GetArguments())
-	if err != nil {
-		return api.NewToolCallResult("", fmt.Errorf("failed to list resources, %s", err)), nil
-	}
 
 	ns, ok := namespace.(string)
 	if !ok {
@@ -237,7 +238,7 @@ func resourcesList(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list resources: %w", err)), nil
 	}
-	printed, err := params.ListOutput.PrintObjStructured(ret)
+	printed, err := listOutput.PrintObjStructured(ret)
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to format resources: %w", err)), nil
 	}
